@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class CmdResult:
+    args: list[str]
+    exit_code: int
+    stdout: str
+    stderr: str
+    timeout_s: int
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def safe_tail(value: str, max_chars: int) -> str:
+    value = value.strip()
+    if len(value) <= max_chars:
+        return value
+    return value[-max_chars:]
+
+
+def run_cmd(args: list[str], *, timeout_s: int, env: dict[str, str] | None = None) -> CmdResult:
+    try:
+        cp = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_s,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return CmdResult(args=args, exit_code=cp.returncode, stdout=cp.stdout, stderr=cp.stderr, timeout_s=timeout_s)
+    except subprocess.TimeoutExpired as e:
+        stdout = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        stderr = (e.stderr or "") if isinstance(e.stderr, str) else ""
+        stderr = (stderr + "\n" if stderr else "") + f"Timeout after {timeout_s}s"
+        return CmdResult(args=args, exit_code=124, stdout=stdout, stderr=stderr, timeout_s=timeout_s)
+    except FileNotFoundError as e:
+        return CmdResult(args=args, exit_code=127, stdout="", stderr=str(e), timeout_s=timeout_s)
+
+
+def parse_json_arrays(stdout: str, *, errors: list[dict[str, Any]], context: str) -> list[Any]:
+    items: list[Any] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception as e:
+            errors.append(
+                {
+                    "command": "json.parse",
+                    "context": context,
+                    "exitCode": 0,
+                    "message": f"Failed to parse JSON line: {e}",
+                }
+            )
+            continue
+        if isinstance(parsed, list):
+            items.extend(parsed)
+        else:
+            items.append(parsed)
+    return items
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as f:
+        tmp_path = Path(f.name)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(tmp_path, 0o644)
+    os.replace(tmp_path, path)
+
+
+def parse_accounts_env(value: str) -> list[str]:
+    value = value.strip()
+    if not value:
+        return []
+    return [part for part in re.split(r"[,\s]+", value) if part]
+
+
+def remove_key_recursive(obj: Any, key: str) -> None:
+    if isinstance(obj, dict):
+        if key in obj:
+            obj.pop(key, None)
+        for v in list(obj.values()):
+            remove_key_recursive(v, key)
+    elif isinstance(obj, list):
+        for v in obj:
+            remove_key_recursive(v, key)
+
+
+def main() -> int:
+    os.umask(0o022)
+
+    base_dir = Path(__file__).resolve().parent.parent
+    data_dir = base_dir / "public" / "data"
+
+    codexbar_bin = os.environ.get("CODEXBAR_BIN", "/usr/local/bin/codexbar")
+    usage_timeout_s = int(os.environ.get("USAGE_TIMEOUT_S", "60"))
+    cost_timeout_s = int(os.environ.get("COST_TIMEOUT_S", "180"))
+    max_stderr_chars = int(os.environ.get("MAX_STDERR_CHARS", "4000"))
+
+    codex_accounts_dir = Path(os.environ.get("CODEX_ACCOUNTS_DIR", str(Path.home() / ".codex" / "accounts")))
+    codex_config_toml = Path(os.environ.get("CODEX_CONFIG_TOML", str(Path.home() / ".codex" / "config.toml")))
+    selected_accounts = parse_accounts_env(os.environ.get("CODEX_AUTH_ACCOUNTS", ""))
+
+    generated_at = utc_now_iso()
+    hostname = socket.gethostname()
+
+    errors: list[dict[str, Any]] = []
+    usage_items: list[dict[str, Any]] = []
+    cost_items: list[Any] = []
+
+    exit_codes: dict[str, Any] = {"usage": {"codex": {}, "claude": None, "gemini": None}, "cost": None}
+
+    # --- Codex: multi-account via codex-auth profiles (isolated HOME per profile; no global switching).
+    all_account_files = sorted(codex_accounts_dir.glob("*.json")) if codex_accounts_dir.is_dir() else []
+    if selected_accounts:
+        by_name = {p.stem: p for p in all_account_files}
+        account_files: list[Path] = []
+        for name in selected_accounts:
+            p = by_name.get(name)
+            if p is None:
+                errors.append(
+                    {
+                        "command": "codexbar usage --provider codex",
+                        "profile": name,
+                        "exitCode": 1,
+                        "message": f"codex-auth profile not found: {codex_accounts_dir}/{name}.json",
+                    }
+                )
+                continue
+            account_files.append(p)
+    else:
+        account_files = all_account_files
+
+    if not account_files:
+        errors.append(
+            {
+                "command": "codexbar usage --provider codex",
+                "exitCode": 1,
+                "message": f"No codex-auth accounts found in {codex_accounts_dir}",
+            }
+        )
+
+    for account_file in account_files:
+        profile = account_file.stem
+        with tempfile.TemporaryDirectory(prefix="codex-home-") as tmp_home:
+            tmp_home_path = Path(tmp_home)
+            tmp_codex_dir = tmp_home_path / ".codex"
+            tmp_codex_dir.mkdir(parents=True, exist_ok=True)
+            (tmp_codex_dir / "auth.json").symlink_to(account_file)
+            if codex_config_toml.is_file():
+                shutil.copy2(codex_config_toml, tmp_codex_dir / "config.toml")
+
+            env = dict(os.environ)
+            env["HOME"] = tmp_home
+
+            res = run_cmd(
+                [codexbar_bin, "usage", "--provider", "codex", "--format", "json", "--json-only"],
+                timeout_s=usage_timeout_s,
+                env=env,
+            )
+
+        exit_codes["usage"]["codex"][profile] = res.exit_code
+
+        if res.stderr.strip() or res.exit_code != 0:
+            errors.append(
+                {
+                    "command": "codexbar usage --provider codex",
+                    "profile": profile,
+                    "exitCode": res.exit_code,
+                    "message": safe_tail(res.stderr, max_stderr_chars) or f"Exit {res.exit_code}",
+                }
+            )
+
+        parsed = parse_json_arrays(res.stdout, errors=errors, context=f"usage.codex.{profile}")
+        for item in parsed:
+            if isinstance(item, dict):
+                item["codexAuthAccount"] = profile
+                usage_items.append(item)
+
+    # --- Claude usage (OAuth, configured in ~/.codexbar/config.json)
+    claude_res = run_cmd(
+        [codexbar_bin, "usage", "--provider", "claude", "--format", "json", "--json-only"],
+        timeout_s=usage_timeout_s,
+    )
+    exit_codes["usage"]["claude"] = claude_res.exit_code
+    if claude_res.stderr.strip() or claude_res.exit_code != 0:
+        errors.append(
+            {
+                "command": "codexbar usage --provider claude",
+                "exitCode": claude_res.exit_code,
+                "message": safe_tail(claude_res.stderr, max_stderr_chars) or f"Exit {claude_res.exit_code}",
+            }
+        )
+    for item in parse_json_arrays(claude_res.stdout, errors=errors, context="usage.claude"):
+        if isinstance(item, dict):
+            usage_items.append(item)
+
+    # --- Gemini usage (API via Gemini CLI credentials)
+    gemini_res = run_cmd(
+        [codexbar_bin, "usage", "--provider", "gemini", "--source", "api", "--format", "json", "--json-only"],
+        timeout_s=usage_timeout_s,
+    )
+    exit_codes["usage"]["gemini"] = gemini_res.exit_code
+    if gemini_res.stderr.strip() or gemini_res.exit_code != 0:
+        errors.append(
+            {
+                "command": "codexbar usage --provider gemini",
+                "exitCode": gemini_res.exit_code,
+                "message": safe_tail(gemini_res.stderr, max_stderr_chars) or f"Exit {gemini_res.exit_code}",
+            }
+        )
+    for item in parse_json_arrays(gemini_res.stdout, errors=errors, context="usage.gemini"):
+        if isinstance(item, dict):
+            usage_items.append(item)
+
+    # Record provider-level JSON errors even if the command exited 0.
+    for item in usage_items:
+        if not isinstance(item, dict):
+            continue
+        err = item.get("error")
+        if not isinstance(err, dict):
+            continue
+        errors.append(
+            {
+                "command": "codexbar usage",
+                "provider": item.get("provider"),
+                "profile": item.get("codexAuthAccount"),
+                "exitCode": err.get("code", 0),
+                "message": err.get("message", "Provider error"),
+            }
+        )
+
+    # Remove any emails before publishing (public endpoint).
+    remove_key_recursive(usage_items, "accountEmail")
+
+    # --- Cost (local logs; Codex + Claude only)
+    cost_res = run_cmd(
+        [codexbar_bin, "cost", "--provider", "both", "--format", "json", "--json-only"],
+        timeout_s=cost_timeout_s,
+    )
+    exit_codes["cost"] = cost_res.exit_code
+    if cost_res.stderr.strip() or cost_res.exit_code != 0:
+        errors.append(
+            {
+                "command": "codexbar cost --provider both",
+                "exitCode": cost_res.exit_code,
+                "message": safe_tail(cost_res.stderr, max_stderr_chars) or f"Exit {cost_res.exit_code}",
+            }
+        )
+    cost_items = parse_json_arrays(cost_res.stdout, errors=errors, context="cost")
+
+    latest = {
+        "generatedAt": generated_at,
+        "hostname": hostname,
+        "usage": usage_items,
+        "cost": cost_items,
+        "errors": errors,
+    }
+
+    last_run = {
+        "generatedAt": generated_at,
+        "ok": len(errors) == 0,
+        "exitCodes": exit_codes,
+        "errors": errors,
+    }
+
+    atomic_write_json(data_dir / "latest.json", latest)
+    atomic_write_json(data_dir / "last-run.json", last_run)
+    return 0 if last_run["ok"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>stats.lucheestiy.com</title>
+    <meta name="description" content="CodexBar stats dashboard" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div>
+        <h1 class="title">stats.lucheestiy.com</h1>
+        <div class="subtitle">CodexBar dashboard</div>
+      </div>
+      <div class="meta">
+        <div id="updatedAt" class="updated">Loading…</div>
+        <div id="host" class="host"></div>
+      </div>
+    </header>
+
+    <main class="main">
+      <section id="errors" class="errors" hidden></section>
+      <div class="sectionTitle">Usage</div>
+      <section id="providers" class="grid" aria-live="polite"></section>
+
+      <div class="sectionTitle">Cost (local logs)</div>
+      <section id="cost" class="grid" aria-live="polite"></section>
+
+      <section class="raw">
+        <details>
+          <summary>Raw JSON</summary>
+          <pre id="rawJson" class="rawJson"></pre>
+        </details>
+      </section>
+    </main>
+
+    <footer class="footer">
+      Updated every ~5 minutes (systemd timer). Cost is aggregated per provider on this machine (not per Codex profile).
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

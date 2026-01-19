@@ -1,0 +1,9 @@
+# Generated runtime data (contains usage snapshots)
+public/data/*.json
+public/data/.*
+!public/data/.gitkeep
+
+# Local/editor noise
+.DS_Store
+*.log
+__pycache__/
