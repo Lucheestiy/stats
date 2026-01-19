@@ -127,7 +127,7 @@ function buildProviderCard(providerUsage) {
   const identityLines = [];
   if (provider === "codex") {
     if (profile) {
-      identityLines.push(`<div><div class="k">Profile</div><div class="v">${escapeHtml(profile)}</div></div>`);
+      identityLines.push(`<div><div class="k">Account</div><div class="v">${escapeHtml(profile)}</div></div>`);
     }
     if (loginMethod !== "—") {
       identityLines.push(`<div><div class="k">Plan</div><div class="v">${escapeHtml(loginMethod)}</div></div>`);
