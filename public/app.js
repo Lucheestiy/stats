@@ -123,34 +123,30 @@ function buildProviderCard(providerUsage) {
   const loginMethod = providerUsage.usage?.loginMethod || providerUsage.usage?.identity?.loginMethod || "—";
   const providerError = providerUsage.error?.message || null;
 
-  const headRight = `<span class="pill">${escapeHtml(source)}</span>`;
+  const isCodex = provider === "codex";
+  const headRight = isCodex ? "" : `<span class="pill">${escapeHtml(source)}</span>`;
   const identityLines = [];
-  if (provider === "codex") {
-    if (profile) {
-      identityLines.push(`<div><div class="k">Account</div><div class="v">${escapeHtml(profile)}</div></div>`);
-    }
-    if (loginMethod !== "—") {
-      identityLines.push(`<div><div class="k">Plan</div><div class="v">${escapeHtml(loginMethod)}</div></div>`);
-    }
-  } else {
+  if (!isCodex) {
     identityLines.push(`<div><div class="k">Login</div><div class="v">${escapeHtml(loginMethod)}</div></div>`);
   }
 
   const credits = providerUsage.credits?.remaining;
   const creditLine =
-    typeof credits === "number"
+    !isCodex && typeof credits === "number"
       ? `<div><div class="k">Credits</div><div class="v">${escapeHtml(formatNumber(credits))}</div></div>`
       : "";
 
   const usageSection = buildUsageSection(providerUsage.usage);
   const errorSection = providerError ? `<div class="inlineError">${escapeHtml(providerError)}</div>` : "";
+  const meta = `${identityLines.join("")}${creditLine}`;
+  const metaSection = meta ? `<div class="kv">${meta}</div>` : "";
 
   return `
     <article class="card">
       <div class="cardHeader">
         <div>
           <h2 class="providerName">${escapeHtml(name)}</h2>
-          <div class="kv">${identityLines.join("")}${creditLine}</div>
+          ${metaSection}
         </div>
         <div>${headRight}</div>
       </div>
