@@ -45,6 +45,17 @@ function formatUsd(value) {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 }
 
+function formatPercent(value) {
+  if (value === null || value === undefined) return "—";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+
+  const abs = Math.abs(n);
+  const decimals = abs > 0 && abs < 1 ? 2 : 1;
+  const rounded = n.toFixed(decimals);
+  return rounded.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+}
+
 function windowLabel(minutes) {
   if (!minutes) return "Window";
   if (minutes === 300) return "Session (5h)";
@@ -60,7 +71,7 @@ function percentBadge(usedPercent) {
   const left = Math.max(0, 100 - n);
   let cls = "";
   if (left <= 15) cls = "warn";
-  return { text: `${left}% left`, cls };
+  return { text: `${formatPercent(left)}% left`, cls };
 }
 
 function buildUsageSection(usage) {
@@ -77,7 +88,7 @@ function buildUsageSection(usage) {
       const u = usage[key];
       if (!u) return "";
       const used = Number(u.usedPercent);
-      const usedText = Number.isFinite(used) ? `${used}% used` : "—";
+      const usedText = Number.isFinite(used) ? `${formatPercent(used)}% used` : "—";
       const badge = percentBadge(u.usedPercent);
       const fill = Number.isFinite(used) ? Math.min(100, Math.max(0, used)) : 0;
       const reset = u.resetsAt ? `Resets: ${formatIso(u.resetsAt)}` : null;
