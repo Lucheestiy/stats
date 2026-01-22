@@ -2,9 +2,11 @@
 const DATA_URL = "/data/latest.json";
 const HISTORY_URL = "/data/history.json";
 const REFRESH_MS = 60_000;
+const DAY_TZ_STORAGE_KEY = "codexbar-day-tz"; // "en" (New York) | "ru" (Minsk)
 
 // State
 let currentLang = localStorage.getItem("codexbar-lang") || "en";
+let dayTzOverride = localStorage.getItem(DAY_TZ_STORAGE_KEY) || "";
 let currentTheme = localStorage.getItem("codexbar-theme") || "dark";
 let currentSort = "reset";
 let compareMode = false;
@@ -36,6 +38,7 @@ const i18n = {
     week: "Week",
     window: "Window",
     today: "Today",
+    yesterday: "Yesterday",
     last30Days: "Last 30 days",
     tokens: "tokens",
     left: "left",
@@ -87,6 +90,7 @@ const i18n = {
     week: "Неделя",
     window: "Окно",
     today: "Сегодня",
+    yesterday: "Вчера",
     last30Days: "Последние 30 дней",
     tokens: "токенов",
     left: "осталось",
@@ -135,6 +139,8 @@ const chartTooltip = document.getElementById("chartTooltip");
 const chartLegend = document.getElementById("chartLegend");
 const langToggle = document.getElementById("langToggle");
 const langLabel = document.getElementById("langLabel");
+const tzToggle = document.getElementById("tzToggle");
+const tzLabelEl = document.getElementById("tzLabel");
 const themeToggle = document.getElementById("themeToggle");
 const compareToggleBtn = document.getElementById("compareToggle");
 const sortButtons = document.querySelectorAll(".sortBtn");
@@ -142,6 +148,83 @@ const sortButtons = document.querySelectorAll(".sortBtn");
 // Utility functions
 function t(key) {
   return i18n[currentLang]?.[key] || i18n.en[key] || key;
+}
+
+function getDayBucketKey() {
+  if (dayTzOverride === "en" || dayTzOverride === "ru") return dayTzOverride;
+  return currentLang === "ru" ? "ru" : "en";
+}
+
+function getTimeZoneInfo() {
+  const key = getDayBucketKey();
+  if (key === "ru") {
+    return { key, timeZone: "Europe/Minsk", label: currentLang === "ru" ? "Минск" : "Minsk" };
+  }
+  return { key, timeZone: "America/New_York", label: currentLang === "ru" ? "Нью-Йорк" : "New York" };
+}
+
+function getCostForCurrentView(data) {
+  const costByLang = data?.costByLang;
+  const picked = costByLang?.[getDayBucketKey()];
+  if (Array.isArray(picked)) return picked;
+  if (Array.isArray(data?.cost)) return data.cost;
+  return [];
+}
+
+function formatYmdInTimeZone(date, timeZone) {
+  try {
+    const formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    const parts = formatter.formatToParts(date);
+    const getPart = (type) => parts.find(p => p.type === type)?.value || "";
+    const year = getPart("year");
+    const month = getPart("month");
+    const day = getPart("day");
+    return year && month && day ? `${year}-${month}-${day}` : formatter.format(date);
+  } catch {
+    return "";
+  }
+}
+
+function getTodayRange() {
+  const { timeZone, label } = getTimeZoneInfo();
+  const now = new Date();
+  const today = formatYmdInTimeZone(now, timeZone);
+  const tomorrow = formatYmdInTimeZone(new Date(now.getTime() + 24 * 60 * 60 * 1000), timeZone);
+  return { timeZone, label, today, tomorrow };
+}
+
+function getTodayRangeText() {
+  const { label, today, tomorrow } = getTodayRange();
+  if (!today || !tomorrow) return label;
+  return `${label}: ${today} 00:00 → ${tomorrow} 00:00`;
+}
+
+function getTodayYmd() {
+  return getTodayRange().today;
+}
+
+function getDailyTotalsForDate(cost, dateYmd) {
+  const daily = Array.isArray(cost?.daily) ? cost.daily : [];
+  const entry = daily.find(d => d?.date === dateYmd);
+  const totalCost = Number(entry?.totalCost ?? 0);
+  const totalTokens = Number(entry?.totalTokens ?? 0);
+  return {
+    totalCost: Number.isFinite(totalCost) ? totalCost : 0,
+    totalTokens: Number.isFinite(totalTokens) ? totalTokens : 0,
+  };
+}
+
+function addDaysToYmd(ymd, deltaDays) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ymd))) return "";
+  const d = new Date(`${ymd}T12:00:00Z`);
+  if (Number.isNaN(d.getTime())) return "";
+  d.setUTCDate(d.getUTCDate() + Number(deltaDays || 0));
+  return d.toISOString().slice(0, 10);
 }
 
 function escapeHtml(value) {
@@ -165,12 +248,7 @@ function formatIso(iso) {
     minute: "2-digit",
     second: "2-digit",
   };
-  // RU: Minsk (UTC+3), EN: New York (UTC-5/UTC-4 DST)
-  if (currentLang === "ru") {
-    opts.timeZone = "Europe/Minsk";
-  } else {
-    opts.timeZone = "America/New_York";
-  }
+  opts.timeZone = getTimeZoneInfo().timeZone;
   return d.toLocaleString(currentLang === "ru" ? "ru-RU" : "en-US", opts);
 }
 
@@ -282,6 +360,17 @@ function getProviderIcon(provider) {
 }
 
 // Update i18n text
+function updateTzLabel() {
+  const tz = getTimeZoneInfo();
+  if (tzLabelEl) tzLabelEl.textContent = tz.label;
+  if (tzToggle) {
+    tzToggle.classList.toggle("active", dayTzOverride === "en" || dayTzOverride === "ru");
+    tzToggle.title = currentLang === "ru"
+      ? "Часовой пояс дня (клик: переключить, Shift+клик: авто)"
+      : "Day timezone (click: toggle, Shift-click: auto)";
+  }
+}
+
 function updateI18n() {
   document.querySelectorAll("[data-i18n]").forEach(el => {
     const key = el.getAttribute("data-i18n");
@@ -290,6 +379,7 @@ function updateI18n() {
     }
   });
   langLabel.textContent = currentLang.toUpperCase();
+  updateTzLabel();
 }
 
 // Theme toggle
@@ -383,6 +473,13 @@ function buildCostSection(cost) {
 
   const totals = cost.totals || {};
   const hasCache = totals.cacheReadTokens !== undefined || totals.cacheCreationTokens !== undefined;
+  const todayRange = getTodayRange();
+  const todayYmd = todayRange.today;
+  const todayTotals = todayYmd ? getDailyTotalsForDate(cost, todayYmd) : { totalCost: 0, totalTokens: 0 };
+  const todayRangeLine = todayRange.today && todayRange.tomorrow ? `${todayRange.today} 00:00 → ${todayRange.tomorrow} 00:00` : "";
+  const yesterdayYmd = todayYmd ? addDaysToYmd(todayYmd, -1) : "";
+  const yesterdayTotals = yesterdayYmd ? getDailyTotalsForDate(cost, yesterdayYmd) : { totalCost: 0, totalTokens: 0 };
+  const yesterdayRangeLine = yesterdayYmd && todayYmd ? `${yesterdayYmd} 00:00 → ${todayYmd} 00:00` : "";
 
   let tokenBreakdown = "";
   if (totals.inputTokens !== undefined || totals.outputTokens !== undefined || hasCache) {
@@ -412,8 +509,12 @@ function buildCostSection(cost) {
   return `
     <div class="costBlock">
       <div>
-        <div class="k">${t("today")}</div>
-        <div class="v">${escapeHtml(formatUsd(cost.sessionCostUSD))} · ${escapeHtml(formatNumber(cost.sessionTokens))} ${t("tokens")}</div>
+        <div class="k">${escapeHtml(todayRange.label)}${todayRangeLine ? `<span class="todayRange">${escapeHtml(todayRangeLine)}</span>` : ""}</div>
+        <div class="v">${escapeHtml(formatUsd(todayTotals.totalCost))} · ${escapeHtml(formatNumber(todayTotals.totalTokens))} ${t("tokens")}</div>
+      </div>
+      <div>
+        <div class="k">${escapeHtml(todayRange.label)} · ${t("yesterday")}${yesterdayRangeLine ? `<span class="todayRange">${escapeHtml(yesterdayRangeLine)}</span>` : ""}</div>
+        <div class="v">${escapeHtml(formatUsd(yesterdayTotals.totalCost))} · ${escapeHtml(formatNumber(yesterdayTotals.totalTokens))} ${t("tokens")}</div>
       </div>
       <div>
         <div class="k">${t("last30Days")} ${comparisonHtml}</div>
@@ -524,24 +625,38 @@ function buildCostCard(cost) {
 // Stats summary
 function buildStatsSummary(data) {
   const usage = Array.isArray(data.usage) ? data.usage : [];
-  const cost = Array.isArray(data.cost) ? data.cost : [];
+  const cost = getCostForCurrentView(data);
+  const todayRange = getTodayRange();
+  const tzLabel = todayRange.label;
+  const todayRangeText = getTodayRangeText();
+  const todayYmd = todayRange.today;
+  const todayRangeLine = todayRange.today && todayRange.tomorrow ? `${todayRange.today} 00:00 → ${todayRange.tomorrow} 00:00` : "";
+  const yesterdayYmd = todayYmd ? addDaysToYmd(todayYmd, -1) : "";
+  const yesterdayRangeText = yesterdayYmd && todayYmd ? `${tzLabel}: ${yesterdayYmd} 00:00 → ${todayYmd} 00:00` : tzLabel;
 
   let totalCost30 = 0;
   let totalTokens30 = 0;
   let todayCost = 0;
+  let yesterdayCost = 0;
 
   for (const c of cost) {
     totalCost30 += c.last30DaysCostUSD || 0;
     totalTokens30 += c.last30DaysTokens || 0;
-    todayCost += c.sessionCostUSD || 0;
+    if (todayYmd) todayCost += getDailyTotalsForDate(c, todayYmd).totalCost;
+    if (yesterdayYmd) yesterdayCost += getDailyTotalsForDate(c, yesterdayYmd).totalCost;
   }
 
   const avgDaily = totalCost30 / 30;
 
   return `
-    <div class="statBox">
-      <div class="label">${t("today")}</div>
+    <div class="statBox" title="${escapeHtml(todayRangeText)}">
+      <div class="label">${escapeHtml(tzLabel)}</div>
       <div class="value">${formatUsd(todayCost)}</div>
+      ${todayRangeLine ? `<div class="subtext">${escapeHtml(todayRangeLine)}</div>` : ""}
+    </div>
+    <div class="statBox" title="${escapeHtml(yesterdayRangeText)}">
+      <div class="label">${t("yesterday")} (${escapeHtml(tzLabel)})</div>
+      <div class="value">${formatUsd(yesterdayCost)}</div>
     </div>
     <div class="statBox">
       <div class="label">${t("last30Days")}</div>
@@ -684,8 +799,7 @@ function getLastNDays(n) {
   const days = [];
   const now = new Date();
 
-  // RU: Europe/Minsk, EN: America/New_York
-  const timezone = currentLang === "ru" ? "Europe/Minsk" : "America/New_York";
+  const timezone = getTimeZoneInfo().timeZone;
 
   // Use Intl.DateTimeFormat for reliable timezone conversion (en-CA gives YYYY-MM-DD order)
   const formatter = new Intl.DateTimeFormat("en-CA", {
@@ -718,8 +832,7 @@ function getTimezoneAwareHourDay(ts) {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return null;
 
-  // RU: Europe/Minsk (UTC+3), EN: America/New_York (UTC-5/UTC-4 DST)
-  const timezone = currentLang === "ru" ? "Europe/Minsk" : "America/New_York";
+  const timezone = getTimeZoneInfo().timeZone;
 
   // Use Intl.DateTimeFormat for reliable timezone conversion
   const formatter = new Intl.DateTimeFormat("en-CA", {
@@ -787,9 +900,7 @@ function buildHeatmapForProvider(history, providerKey) {
 
   // Data rows - RU: Minsk, EN: New York
   for (const day of days) {
-    const dateOpts = currentLang === "ru"
-      ? { timeZone: "Europe/Minsk", weekday: "short", month: "short", day: "numeric" }
-      : { timeZone: "America/New_York", weekday: "short", month: "short", day: "numeric" };
+    const dateOpts = { timeZone: getTimeZoneInfo().timeZone, weekday: "short", month: "short", day: "numeric" };
     const shortDay = new Date(day + "T12:00:00Z").toLocaleDateString(currentLang === "ru" ? "ru-RU" : "en-US", dateOpts);
 
     let dayTotal = 0;
@@ -799,10 +910,10 @@ function buildHeatmapForProvider(history, providerKey) {
       const activity = lookup[day]?.[h] ?? null;
       if (activity) dayTotal += activity;
       const cls = getIntensityClass(activity);
-      const titleText = activity !== null && activity > 0 ? `${activity.toFixed(1)}% ${t("activity")}` : t("noActivity");
+      const titleText = activity !== null && activity > 0 ? t("activity") : t("noActivity");
       html += `<div class="heatmapCell ${cls}" data-day="${day}" data-hour="${h}" data-activity="${activity || 0}" title="${escapeHtml(day)} ${h}:00 - ${escapeHtml(titleText)}"></div>`;
     }
-    html += `<div class="heatmapRowTotal">${dayTotal > 0 ? dayTotal.toFixed(1) + "%" : ""}</div>`;
+    html += `<div class="heatmapRowTotal"></div>`;
     html += `</div>`;
   }
 
@@ -849,22 +960,13 @@ function renderHeatmap(history, usageData) {
 
   const historyArray = Array.isArray(history) ? history : [];
 
-  // Calculate totals for each provider
-  // Show timezone indicator based on language
-  const tzLabel = currentLang === "ru" ? "Минск" : "New York";
+  // Show day/timezone indicator for the current view (not strictly tied to language).
+  const tzLabel = getTimeZoneInfo().label;
 
   let html = "";
   for (const [key, info] of providers) {
-    let total = 0;
-    for (const entry of historyArray) {
-      const entryKey = `${entry.provider}|${entry.account || ""}`;
-      if (entryKey === key) {
-        total += entry.activity || 0;
-      }
-    }
-
     html += `<div class="card heatmapCard">`;
-    html += `<h3 class="heatmapTitle">${getProviderIcon(info.provider)}${escapeHtml(info.label)}<span class="heatmapTotal">${total > 0 ? `(${total.toFixed(1)}% total)` : ""}</span> <span class="tzIndicator" style="font-size:0.7em;opacity:0.6;margin-left:8px;">${tzLabel}</span></h3>`;
+    html += `<h3 class="heatmapTitle">${getProviderIcon(info.provider)}${escapeHtml(info.label)} <span class="tzIndicator" style="font-size:0.7em;opacity:0.6;margin-left:8px;">${tzLabel}</span></h3>`;
     html += buildHeatmapForProvider(historyArray, key);
     html += `</div>`;
   }
@@ -886,7 +988,7 @@ function renderHeatmap(history, usageData) {
         heatmapDetailEl.innerHTML = `
           <h4>${day} at ${hour}:00</h4>
           <div class="heatmapDetailContent">
-            ${t("activity")}: ${Number(activity).toFixed(1)}%
+            ${Number(activity) > 0 ? t("activity") : t("noActivity")}
           </div>
         `;
       }
@@ -940,7 +1042,7 @@ function render(data) {
   statsSummaryEl.innerHTML = buildStatsSummary(data);
 
   const usage = Array.isArray(data.usage) ? data.usage : [];
-  const cost = Array.isArray(data.cost) ? data.cost : [];
+  const cost = getCostForCurrentView(data);
 
   const sortedUsage = sortUsage(usage, currentSort);
   providersEl.innerHTML = sortedUsage.map((u, idx) => buildProviderCard(u, idx)).join("");
@@ -1007,11 +1109,28 @@ langToggle.addEventListener("click", () => {
   }
 });
 
+if (tzToggle) {
+  tzToggle.addEventListener("click", (ev) => {
+    if (ev.shiftKey) {
+      dayTzOverride = "";
+      localStorage.removeItem(DAY_TZ_STORAGE_KEY);
+    } else {
+      dayTzOverride = getDayBucketKey() === "en" ? "ru" : "en";
+      localStorage.setItem(DAY_TZ_STORAGE_KEY, dayTzOverride);
+    }
+    updateTzLabel();
+    if (cachedData) {
+      render(cachedData);
+      if (cachedHistory) renderHeatmap(cachedHistory, cachedData.usage);
+    }
+  });
+}
+
 themeToggle.addEventListener("click", () => {
   currentTheme = currentTheme === "dark" ? "light" : "dark";
   localStorage.setItem("codexbar-theme", currentTheme);
   applyTheme();
-  if (cachedData) drawCostChart(cachedData.cost || []);
+  if (cachedData) drawCostChart(getCostForCurrentView(cachedData));
 });
 
 compareToggleBtn.addEventListener("click", () => {
@@ -1045,7 +1164,7 @@ sortButtons.forEach(btn => {
 
 // Handle window resize for chart
 window.addEventListener("resize", () => {
-  if (cachedData) drawCostChart(cachedData.cost || []);
+  if (cachedData) drawCostChart(getCostForCurrentView(cachedData));
 });
 
 // Initialize

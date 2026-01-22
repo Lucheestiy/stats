@@ -266,6 +266,13 @@ body {
   font-size: 12px;
 }
 
+.todayRange {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  opacity: 0.75;
+}
+
 .v {
   font-size: 13px;
 }

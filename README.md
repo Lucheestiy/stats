@@ -44,3 +44,4 @@ Static dashboard that publishes CodexBar CLI output (`codexbar`) on `https://sta
 - Emails (`accountEmail`) are stripped before publishing `data/latest.json` and the UI shows Codex profile names instead.
 - `codexbar cost` only supports Codex + Claude (Gemini cost is not available via CodexBar).
 - Cost is **not separable per `codex-auth` profile** with CodexBar today; it’s computed by scanning local logs and does not carry per-profile/account attribution, so the Codex cost numbers are shared/aggregated.
+- Claude cost on the dashboard merges **CodexBar Claude logs + Clawdbot session transcripts** (so Claude usage via `clawdbot` shows up under Claude cost).

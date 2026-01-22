@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 @dataclass
@@ -199,7 +200,336 @@ def load_history(path: Path) -> list[dict[str, Any]]:
         return []
 
 
-def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], generated_at: str) -> None:
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if not isinstance(value, bool) and value > 0:
+            # Heuristic: treat < 1e12 as seconds, otherwise ms.
+            ts = float(value)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            try:
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            except Exception:
+                return None
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def to_ymd_in_tz(dt_utc: datetime, tz_name: str) -> str:
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return ""
+    try:
+        return dt_utc.astimezone(tz).date().isoformat()
+    except Exception:
+        return ""
+
+
+def as_finite_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = float(value)
+        return n if n >= 0 and n != float("inf") and n == n else None
+    return None
+
+
+def compute_clawdbot_claude_cost_delta(
+    *,
+    tz_name: str,
+    days: int,
+    errors: list[dict[str, Any]],
+    max_stderr_chars: int,
+) -> dict[str, Any] | None:
+    """
+    Clawdbot stores per-message usage+cost in ~/.clawdbot/agents/*/sessions/*.jsonl.
+    CodexBar's `cost` scanner doesn't see these, so we merge them into the Claude
+    cost provider (to match real usage when talking to Claude via Clawdbot).
+    """
+    state_dir = Path(os.environ.get("CLAWDBOT_STATE_DIR", str(Path.home() / ".clawdbot")))
+    agents_dir = state_dir / "agents"
+    if not agents_dir.is_dir():
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    # Include "today" as one of the days (align with dashboard 30d windows).
+    since_utc = now_utc - timedelta(days=max(1, days) - 1)
+    since_ts_s = since_utc.timestamp()
+
+    daily: dict[str, dict[str, Any]] = {}
+    totals: dict[str, float] = {
+        "inputTokens": 0.0,
+        "outputTokens": 0.0,
+        "cacheReadTokens": 0.0,
+        "cacheCreationTokens": 0.0,
+        "totalTokens": 0.0,
+        "totalCost": 0.0,
+        "missingCostEntries": 0.0,
+    }
+
+    session_files = sorted(agents_dir.glob("*/sessions/*.jsonl"))
+    for path in session_files:
+        if path.name.endswith(".jsonl.lock"):
+            continue
+        try:
+            st = path.stat()
+        except Exception:
+            continue
+        if st.st_mtime < since_ts_s:
+            continue
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("type") != "message":
+                        continue
+                    msg = entry.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("role") != "assistant":
+                        continue
+
+                    provider = msg.get("provider") or entry.get("provider")
+                    model = msg.get("model") or entry.get("model")
+                    # Only merge Anthropic/Claude usage; ignore other providers.
+                    if provider not in ("anthropic", "claude") and not str(model or "").startswith("claude-"):
+                        continue
+
+                    usage = msg.get("usage") or entry.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+
+                    dt_utc = parse_iso_datetime(entry.get("timestamp")) or parse_iso_datetime(msg.get("timestamp"))
+                    if dt_utc is None or dt_utc.timestamp() < since_ts_s:
+                        continue
+                    day = to_ymd_in_tz(dt_utc, tz_name)
+                    if not day:
+                        continue
+
+                    bucket = daily.get(day)
+                    if bucket is None:
+                        bucket = {
+                            "date": day,
+                            "inputTokens": 0.0,
+                            "outputTokens": 0.0,
+                            "cacheReadTokens": 0.0,
+                            "cacheCreationTokens": 0.0,
+                            "totalTokens": 0.0,
+                            "totalCost": 0.0,
+                            "missingCostEntries": 0.0,
+                            "modelsUsed": set(),
+                            "modelCosts": {},
+                        }
+                        daily[day] = bucket
+
+                    input_tokens = as_finite_number(usage.get("input"))
+                    output_tokens = as_finite_number(usage.get("output"))
+                    cache_read = as_finite_number(usage.get("cacheRead"))
+                    cache_write = as_finite_number(usage.get("cacheWrite"))
+                    total_tokens = as_finite_number(usage.get("totalTokens")) or as_finite_number(usage.get("total"))
+                    if total_tokens is None:
+                        total_tokens = (input_tokens or 0.0) + (output_tokens or 0.0) + (cache_read or 0.0) + (cache_write or 0.0)
+
+                    cost_total = None
+                    cost = usage.get("cost")
+                    if isinstance(cost, dict):
+                        cost_total = as_finite_number(cost.get("total"))
+                    if cost_total is None:
+                        bucket["missingCostEntries"] += 1.0
+                        totals["missingCostEntries"] += 1.0
+                        cost_total = 0.0
+
+                    bucket["inputTokens"] += input_tokens or 0.0
+                    bucket["outputTokens"] += output_tokens or 0.0
+                    bucket["cacheReadTokens"] += cache_read or 0.0
+                    bucket["cacheCreationTokens"] += cache_write or 0.0
+                    bucket["totalTokens"] += total_tokens
+                    bucket["totalCost"] += cost_total
+
+                    totals["inputTokens"] += input_tokens or 0.0
+                    totals["outputTokens"] += output_tokens or 0.0
+                    totals["cacheReadTokens"] += cache_read or 0.0
+                    totals["cacheCreationTokens"] += cache_write or 0.0
+                    totals["totalTokens"] += total_tokens
+                    totals["totalCost"] += cost_total
+
+                    if isinstance(model, str) and model:
+                        bucket["modelsUsed"].add(model)
+                        model_costs = bucket["modelCosts"]
+                        prev_cost = model_costs.get(model, 0.0)
+                        model_costs[model] = prev_cost + cost_total
+        except Exception as e:
+            errors.append(
+                {
+                    "command": "clawdbot transcripts scan",
+                    "exitCode": 1,
+                    "message": safe_tail(str(e), max_stderr_chars) or "Failed to scan Clawdbot sessions",
+                }
+            )
+
+    if not daily:
+        return None
+
+    daily_items: list[dict[str, Any]] = []
+    for day in sorted(daily.keys()):
+        b = daily[day]
+        model_breakdowns = [
+            {"modelName": name, "cost": cost} for name, cost in sorted(b["modelCosts"].items(), key=lambda kv: kv[1], reverse=True)
+        ]
+        models_used = sorted(b["modelsUsed"])
+        daily_items.append(
+            {
+                "date": b["date"],
+                "inputTokens": b["inputTokens"],
+                "outputTokens": b["outputTokens"],
+                "cacheReadTokens": b["cacheReadTokens"],
+                "cacheCreationTokens": b["cacheCreationTokens"],
+                "totalTokens": b["totalTokens"],
+                "totalCost": b["totalCost"],
+                "modelBreakdowns": model_breakdowns,
+                "modelsUsed": models_used,
+            }
+        )
+
+    return {
+        "updatedAt": utc_now_iso(),
+        "provider": "claude",
+        "source": "clawdbot",
+        "totals": {
+            "inputTokens": totals["inputTokens"],
+            "outputTokens": totals["outputTokens"],
+            "cacheReadTokens": totals["cacheReadTokens"],
+            "cacheCreationTokens": totals["cacheCreationTokens"],
+            "totalTokens": totals["totalTokens"],
+            "totalCost": totals["totalCost"],
+        },
+        "daily": daily_items,
+        "last30DaysTokens": totals["totalTokens"],
+        "last30DaysCostUSD": totals["totalCost"],
+    }
+
+
+def merge_cost_items_by_provider(base: list[Any], delta: dict[str, Any], provider: str) -> None:
+    if not delta:
+        return
+
+    target = None
+    for item in base:
+        if isinstance(item, dict) and item.get("provider") == provider:
+            target = item
+            break
+
+    if target is None:
+        base.append(delta)
+        return
+
+    # Merge totals + 30d totals
+    target_totals = target.get("totals")
+    if not isinstance(target_totals, dict):
+        target_totals = {}
+        target["totals"] = target_totals
+    delta_totals = delta.get("totals")
+    if isinstance(delta_totals, dict):
+        for key in ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "totalTokens", "totalCost"]:
+            a = as_finite_number(target_totals.get(key)) or 0.0
+            b = as_finite_number(delta_totals.get(key)) or 0.0
+            target_totals[key] = a + b
+
+    for key in ["last30DaysTokens", "last30DaysCostUSD"]:
+        a = as_finite_number(target.get(key)) or 0.0
+        b = as_finite_number(delta.get(key)) or 0.0
+        target[key] = a + b
+
+    # Mark combined source to avoid confusion.
+    base_source = str(target.get("source") or "").strip() or "local"
+    delta_source = str(delta.get("source") or "").strip()
+    if delta_source and delta_source not in base_source:
+        target["source"] = f"{base_source}+{delta_source}"
+
+    # Merge daily entries by date
+    target_daily = target.get("daily")
+    if not isinstance(target_daily, list):
+        target_daily = []
+        target["daily"] = target_daily
+    by_date: dict[str, dict[str, Any]] = {}
+    for d in target_daily:
+        if isinstance(d, dict) and isinstance(d.get("date"), str):
+            by_date[d["date"]] = d
+
+    delta_daily = delta.get("daily")
+    if isinstance(delta_daily, list):
+        for d in delta_daily:
+            if not isinstance(d, dict) or not isinstance(d.get("date"), str):
+                continue
+            date = d["date"]
+            existing = by_date.get(date)
+            if existing is None:
+                target_daily.append(d)
+                by_date[date] = d
+                continue
+
+            for key in ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "totalTokens", "totalCost"]:
+                a = as_finite_number(existing.get(key)) or 0.0
+                b = as_finite_number(d.get(key)) or 0.0
+                existing[key] = a + b
+
+            # Merge modelsUsed
+            models_used = set(existing.get("modelsUsed") or []) if isinstance(existing.get("modelsUsed"), list) else set()
+            models_used.update(d.get("modelsUsed") or [])
+            existing["modelsUsed"] = sorted([m for m in models_used if isinstance(m, str) and m])
+
+            # Merge modelBreakdowns
+            def to_cost_map(items: Any) -> dict[str, float]:
+                out: dict[str, float] = {}
+                if not isinstance(items, list):
+                    return out
+                for mb in items:
+                    if not isinstance(mb, dict):
+                        continue
+                    name = mb.get("modelName")
+                    cost = as_finite_number(mb.get("cost")) or 0.0
+                    if isinstance(name, str) and name:
+                        out[name] = out.get(name, 0.0) + cost
+                return out
+
+            merged = to_cost_map(existing.get("modelBreakdowns"))
+            for name, cost in to_cost_map(d.get("modelBreakdowns")).items():
+                merged[name] = merged.get(name, 0.0) + cost
+            existing["modelBreakdowns"] = [
+                {"modelName": name, "cost": cost} for name, cost in sorted(merged.items(), key=lambda kv: kv[1], reverse=True)
+            ]
+
+    target_daily.sort(key=lambda d: d.get("date") or "")
+
+
+def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], generated_at: str, current_codex_account: str | None = None) -> None:
     """
     Track hourly usage history for heatmap visualization.
     Calculates delta (activity) by comparing current values to previous run.
@@ -229,6 +559,7 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
 
         provider = item.get("provider", "unknown")
         account = item.get("codexAuthAccount", "")
+
         usage = item.get("usage", {})
         if not isinstance(usage, dict):
             continue
@@ -240,6 +571,7 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
             continue
 
         key = f"{provider}|{account}"
+        # Always update state for all accounts (needed for accurate delta calculation on switch)
         current_state[key] = {"sessionPct": session_pct, "ts": generated_at}
 
         # Calculate activity delta
@@ -256,6 +588,10 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
         elif session_pct is not None and session_pct > 0:
             # First run or no previous data - if there's usage, record it
             activity = session_pct
+
+        # For codex provider, only record history for the current active account
+        if provider == "codex" and current_codex_account and account != current_codex_account:
+            continue
 
         # Only record if there was meaningful activity (> 0.1% to avoid noise)
         if activity > 0.1:
@@ -465,21 +801,74 @@ def main() -> int:
     remove_key_recursive(usage_items, "accountEmail")
 
     # --- Cost (local logs; Codex + Claude only)
-    cost_res = run_cmd(
-        [codexbar_bin, "cost", "--provider", "both", "--format", "json", "--json-only"],
-        timeout_s=cost_timeout_s,
-        env=base_env,
-    )
-    exit_codes["cost"] = cost_res.exit_code
-    if cost_res.stderr.strip() or cost_res.exit_code != 0:
+    #
+    # CodexBar groups daily totals by the process timezone. The dashboards need:
+    # - EN: New York day boundaries
+    # - RU: Minsk day boundaries
+    #
+    # We compute both and publish them so the frontend can switch based on language.
+    def run_cost_for_lang(lang: str, tz_name: str, *, refresh: bool) -> CmdResult:
+        env = dict(base_env)
+        env["TZ"] = tz_name
+        args = [codexbar_bin, "cost", "--provider", "both", "--format", "json", "--json-only"]
+        if refresh:
+            args.append("--refresh")
+        return run_cmd(args, timeout_s=cost_timeout_s, env=env)
+
+    # Refresh scan results on the first run to avoid stale "Today" totals.
+    cost_res_en = run_cost_for_lang("en", "America/New_York", refresh=True)
+    cost_res_ru = run_cost_for_lang("ru", "Europe/Minsk", refresh=False)
+
+    exit_codes["cost"] = {"en": cost_res_en.exit_code, "ru": cost_res_ru.exit_code}
+
+    if cost_res_en.stderr.strip() or cost_res_en.exit_code != 0:
         errors.append(
             {
                 "command": "codexbar cost --provider both",
-                "exitCode": cost_res.exit_code,
-                "message": safe_tail(cost_res.stderr, max_stderr_chars) or f"Exit {cost_res.exit_code}",
+                "lang": "en",
+                "tz": "America/New_York",
+                "exitCode": cost_res_en.exit_code,
+                "message": safe_tail(cost_res_en.stderr, max_stderr_chars) or f"Exit {cost_res_en.exit_code}",
             }
         )
-    cost_items = parse_json_arrays(cost_res.stdout, errors=errors, context="cost")
+    if cost_res_ru.stderr.strip() or cost_res_ru.exit_code != 0:
+        errors.append(
+            {
+                "command": "codexbar cost --provider both",
+                "lang": "ru",
+                "tz": "Europe/Minsk",
+                "exitCode": cost_res_ru.exit_code,
+                "message": safe_tail(cost_res_ru.stderr, max_stderr_chars) or f"Exit {cost_res_ru.exit_code}",
+            }
+        )
+
+    cost_items_en = parse_json_arrays(cost_res_en.stdout, errors=errors, context="cost.en")
+    cost_items_ru = parse_json_arrays(cost_res_ru.stdout, errors=errors, context="cost.ru")
+
+    # --- Clawdbot Claude cost (local session transcripts)
+    #
+    # Clawdbot uses `claude -p --output-format json ...` and records per-message
+    # usage/cost into ~/.clawdbot session transcripts. CodexBar doesn't scan
+    # those files, so we merge them into the Claude cost provider.
+    claw_cost_en = compute_clawdbot_claude_cost_delta(
+        tz_name="America/New_York",
+        days=30,
+        errors=errors,
+        max_stderr_chars=max_stderr_chars,
+    )
+    claw_cost_ru = compute_clawdbot_claude_cost_delta(
+        tz_name="Europe/Minsk",
+        days=30,
+        errors=errors,
+        max_stderr_chars=max_stderr_chars,
+    )
+    if claw_cost_en:
+        merge_cost_items_by_provider(cost_items_en, claw_cost_en, "claude")
+    if claw_cost_ru:
+        merge_cost_items_by_provider(cost_items_ru, claw_cost_ru, "claude")
+
+    # Back-compat: keep the original `cost` field in EN (New York).
+    cost_items = cost_items_en
 
     # Best-effort cleanup for rare cases where CodexBar launches a Claude CLI session
     # that detaches and keeps running.
@@ -491,6 +880,10 @@ def main() -> int:
         "currentCodexAccount": current_codex_account,
         "usage": usage_items,
         "cost": cost_items,
+        "costByLang": {
+            "en": cost_items_en,
+            "ru": cost_items_ru,
+        },
         "errors": errors,
     }
 
@@ -504,8 +897,8 @@ def main() -> int:
     atomic_write_json(data_dir / "latest.json", latest)
     atomic_write_json(data_dir / "last-run.json", last_run)
 
-    # Update hourly history for heatmap
-    update_hourly_history(data_dir, usage_items, generated_at)
+    # Update hourly history for heatmap (only current codex account)
+    update_hourly_history(data_dir, usage_items, generated_at, current_codex_account)
 
     return 0 if last_run["ok"] else 0
 
