@@ -4,10 +4,11 @@ import os
 import re
 import shutil
 import socket
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,26 +33,124 @@ def safe_tail(value: str, max_chars: int) -> str:
     return value[-max_chars:]
 
 
+def ensure_path_has_dir(env: dict[str, str], directory: str) -> dict[str, str]:
+    directory = directory.strip()
+    if not directory:
+        return env
+
+    current = env.get("PATH", "")
+    parts = [p for p in current.split(os.pathsep) if p] if current else []
+    if directory in parts:
+        return env
+
+    updated = dict(env)
+    updated["PATH"] = os.pathsep.join([directory] + parts) if parts else directory
+    return updated
+
+
 def run_cmd(args: list[str], *, timeout_s: int, env: dict[str, str] | None = None) -> CmdResult:
     try:
-        cp = subprocess.run(
+        proc = subprocess.Popen(
             args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout_s,
             env=env,
             text=True,
             encoding="utf-8",
             errors="replace",
+            start_new_session=True,
         )
-        return CmdResult(args=args, exit_code=cp.returncode, stdout=cp.stdout, stderr=cp.stderr, timeout_s=timeout_s)
+    except FileNotFoundError as e:
+        return CmdResult(args=args, exit_code=127, stdout="", stderr=str(e), timeout_s=timeout_s)
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return CmdResult(args=args, exit_code=proc.returncode or 0, stdout=stdout, stderr=stderr, timeout_s=timeout_s)
     except subprocess.TimeoutExpired as e:
-        stdout = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        stdout = (e.output or "") if isinstance(e.output, str) else ""
         stderr = (e.stderr or "") if isinstance(e.stderr, str) else ""
+
+        # Kill the whole process group to avoid leaving orphaned children behind.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        try:
+            more_stdout, more_stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            more_stdout, more_stderr = proc.communicate()
+
+        if more_stdout:
+            stdout = (stdout or "") + more_stdout
+        if more_stderr:
+            stderr = (stderr + "\n" if stderr else "") + more_stderr
+
         stderr = (stderr + "\n" if stderr else "") + f"Timeout after {timeout_s}s"
         return CmdResult(args=args, exit_code=124, stdout=stdout, stderr=stderr, timeout_s=timeout_s)
     except FileNotFoundError as e:
         return CmdResult(args=args, exit_code=127, stdout="", stderr=str(e), timeout_s=timeout_s)
+
+
+def run_codexbar_claude_guard() -> None:
+    guard_path = Path("/usr/local/sbin/codexbar-claude-guard")
+    if not guard_path.is_file():
+        return
+    run_cmd([str(guard_path)], timeout_s=10)
+
+
+def is_claude_oauth_token_expired(res: CmdResult) -> bool:
+    haystack = f"{res.stdout}\n{res.stderr}".lower()
+    return "claude oauth token expired" in haystack or "oauth token expired" in haystack
+
+
+def resolve_claude_bin() -> str:
+    """
+    systemd timers often run with a minimal PATH that excludes ~/.local/bin.
+    Prefer an explicit env override, then PATH lookup, then ~/.local/bin.
+    """
+    env_bin = os.environ.get("CLAUDE_BIN")
+    if env_bin:
+        return env_bin
+
+    which_bin = shutil.which("claude")
+    if which_bin:
+        return which_bin
+
+    local_bin = Path.home() / ".local" / "bin" / "claude"
+    if local_bin.is_file():
+        return str(local_bin)
+
+    return "claude"
+
+
+def refresh_claude_oauth_token(*, errors: list[dict[str, Any]], max_stderr_chars: int) -> None:
+    """
+    Best-effort auth refresh to keep CodexBar's Claude OAuth source working.
+
+    CodexBar suggests: "Run `claude` to refresh." Running a very-low-budget
+    `claude -p ...` appears to refresh tokens without making an API call.
+    """
+    claude_bin = resolve_claude_bin()
+    max_budget_usd = os.environ.get("CLAUDE_REFRESH_MAX_BUDGET_USD", "0.0001")
+    timeout_s = int(os.environ.get("CLAUDE_REFRESH_TIMEOUT_S", "60"))
+
+    res = run_cmd(
+        [claude_bin, "-p", "ping", "--output-format", "json", "--max-budget-usd", max_budget_usd],
+        timeout_s=timeout_s,
+    )
+    if res.exit_code != 0:
+        errors.append(
+            {
+                "command": "claude refresh",
+                "exitCode": res.exit_code,
+                "message": safe_tail(res.stderr, max_stderr_chars) or f"Exit {res.exit_code}",
+            }
+        )
 
 
 def parse_json_arrays(stdout: str, *, errors: list[dict[str, Any]], context: str) -> list[Any]:
@@ -89,6 +188,97 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     os.replace(tmp_path, path)
 
 
+def load_history(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], generated_at: str) -> None:
+    """
+    Track hourly usage history for heatmap visualization.
+    Calculates delta (activity) by comparing current values to previous run.
+    Each entry: {ts, hour, day, provider, account, activity}
+    Keep last 30 days of data.
+    """
+    history_path = data_dir / "history.json"
+    state_path = data_dir / ".history_state.json"
+
+    history = load_history(history_path)
+    prev_state = load_history(state_path) if state_path.is_file() else {}
+    if isinstance(prev_state, list):
+        prev_state = {}
+
+    # Use local time for hour/day display
+    now_local = datetime.now()
+    now = datetime.now(timezone.utc)
+    hour = now_local.hour
+    day = now_local.strftime("%Y-%m-%d")
+
+    current_state: dict[str, Any] = {}
+
+    # Extract usage percentages and calculate deltas
+    for item in usage_items:
+        if not isinstance(item, dict):
+            continue
+
+        provider = item.get("provider", "unknown")
+        account = item.get("codexAuthAccount", "")
+        usage = item.get("usage", {})
+        if not isinstance(usage, dict):
+            continue
+
+        primary = usage.get("primary", {})
+        session_pct = primary.get("usedPercent") if isinstance(primary, dict) else None
+
+        if session_pct is None:
+            continue
+
+        key = f"{provider}|{account}"
+        current_state[key] = {"sessionPct": session_pct, "ts": generated_at}
+
+        # Calculate activity delta
+        prev = prev_state.get(key, {})
+        prev_pct = prev.get("sessionPct")
+
+        activity = 0.0
+        if prev_pct is not None and session_pct is not None:
+            # If session reset (current < previous), count current as new activity
+            if session_pct < prev_pct - 0.5:  # Allow small tolerance for reset detection
+                activity = session_pct
+            else:
+                activity = session_pct - prev_pct
+        elif session_pct is not None and session_pct > 0:
+            # First run or no previous data - if there's usage, record it
+            activity = session_pct
+
+        # Only record if there was meaningful activity (> 0.1% to avoid noise)
+        if activity > 0.1:
+            entry = {
+                "ts": generated_at,
+                "hour": hour,
+                "day": day,
+                "provider": provider,
+                "account": account,
+                "activity": round(activity, 1),
+            }
+            history.append(entry)
+
+    # Save current state for next comparison
+    atomic_write_json(state_path, current_state)
+
+    # Prune entries older than 30 days
+    cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    history = [e for e in history if e.get("day", "") >= cutoff]
+
+    atomic_write_json(history_path, history)
+
+
 def parse_accounts_env(value: str) -> list[str]:
     value = value.strip()
     if not value:
@@ -113,6 +303,8 @@ def main() -> int:
     base_dir = Path(__file__).resolve().parent.parent
     data_dir = base_dir / "public" / "data"
 
+    base_env = ensure_path_has_dir(dict(os.environ), str(Path.home() / ".local" / "bin"))
+
     codexbar_bin = os.environ.get("CODEXBAR_BIN", "/usr/local/bin/codexbar")
     usage_timeout_s = int(os.environ.get("USAGE_TIMEOUT_S", "60"))
     cost_timeout_s = int(os.environ.get("COST_TIMEOUT_S", "180"))
@@ -124,6 +316,15 @@ def main() -> int:
 
     generated_at = utc_now_iso()
     hostname = socket.gethostname()
+
+    # Get current active codex account
+    current_codex_account = None
+    current_file = Path.home() / ".codex" / "current"
+    if current_file.is_file():
+        try:
+            current_codex_account = current_file.read_text().strip()
+        except Exception:
+            pass
 
     errors: list[dict[str, Any]] = []
     usage_items: list[dict[str, Any]] = []
@@ -171,7 +372,7 @@ def main() -> int:
             if codex_config_toml.is_file():
                 shutil.copy2(codex_config_toml, tmp_codex_dir / "config.toml")
 
-            env = dict(os.environ)
+            env = dict(base_env)
             env["HOME"] = tmp_home
 
             res = run_cmd(
@@ -202,7 +403,15 @@ def main() -> int:
     claude_res = run_cmd(
         [codexbar_bin, "usage", "--provider", "claude", "--format", "json", "--json-only"],
         timeout_s=usage_timeout_s,
+        env=base_env,
     )
+    if is_claude_oauth_token_expired(claude_res):
+        refresh_claude_oauth_token(errors=errors, max_stderr_chars=max_stderr_chars)
+        claude_res = run_cmd(
+            [codexbar_bin, "usage", "--provider", "claude", "--format", "json", "--json-only"],
+            timeout_s=usage_timeout_s,
+            env=base_env,
+        )
     exit_codes["usage"]["claude"] = claude_res.exit_code
     if claude_res.stderr.strip() or claude_res.exit_code != 0:
         errors.append(
@@ -220,6 +429,7 @@ def main() -> int:
     gemini_res = run_cmd(
         [codexbar_bin, "usage", "--provider", "gemini", "--source", "api", "--format", "json", "--json-only"],
         timeout_s=usage_timeout_s,
+        env=base_env,
     )
     exit_codes["usage"]["gemini"] = gemini_res.exit_code
     if gemini_res.stderr.strip() or gemini_res.exit_code != 0:
@@ -258,6 +468,7 @@ def main() -> int:
     cost_res = run_cmd(
         [codexbar_bin, "cost", "--provider", "both", "--format", "json", "--json-only"],
         timeout_s=cost_timeout_s,
+        env=base_env,
     )
     exit_codes["cost"] = cost_res.exit_code
     if cost_res.stderr.strip() or cost_res.exit_code != 0:
@@ -270,9 +481,14 @@ def main() -> int:
         )
     cost_items = parse_json_arrays(cost_res.stdout, errors=errors, context="cost")
 
+    # Best-effort cleanup for rare cases where CodexBar launches a Claude CLI session
+    # that detaches and keeps running.
+    run_codexbar_claude_guard()
+
     latest = {
         "generatedAt": generated_at,
         "hostname": hostname,
+        "currentCodexAccount": current_codex_account,
         "usage": usage_items,
         "cost": cost_items,
         "errors": errors,
@@ -287,6 +503,10 @@ def main() -> int:
 
     atomic_write_json(data_dir / "latest.json", latest)
     atomic_write_json(data_dir / "last-run.json", last_run)
+
+    # Update hourly history for heatmap
+    update_hourly_history(data_dir, usage_items, generated_at)
+
     return 0 if last_run["ok"] else 0
 
 
