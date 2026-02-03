@@ -134,46 +134,111 @@ def refresh_claude_oauth_token(*, errors: list[dict[str, Any]], max_stderr_chars
     """
     Best-effort auth refresh to keep CodexBar's Claude OAuth source working.
 
-    CodexBar suggests: "Run `claude` to refresh." Running a very-low-budget
-    `claude -p ...` appears to refresh tokens without making an API call.
+    CodexBar suggests: "Run `claude` to refresh." We do this via a tiny
+    `claude -p ...` request, which *may spend Claude credits* (model call).
     """
     claude_bin = resolve_claude_bin()
     max_budget_usd = os.environ.get("CLAUDE_REFRESH_MAX_BUDGET_USD", "0.0001")
     timeout_s = int(os.environ.get("CLAUDE_REFRESH_TIMEOUT_S", "60"))
 
+    model = os.environ.get("CLAUDE_REFRESH_MODEL", "sonnet").strip()
+    no_session_persistence = os.environ.get("CLAUDE_REFRESH_NO_SESSION_PERSISTENCE", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    tools_value = os.environ.get("CLAUDE_REFRESH_TOOLS")
+    # Default to disabling tools entirely to minimize prompt size/cost.
+    if tools_value is None:
+        tools_value = ""
+
+    args = [claude_bin, "-p", "ping", "--output-format", "json", "--max-budget-usd", max_budget_usd]
+    if model:
+        args.extend(["--model", model])
+    args.extend(["--tools", tools_value])
+    if no_session_persistence:
+        args.append("--no-session-persistence")
+
     res = run_cmd(
-        [claude_bin, "-p", "ping", "--output-format", "json", "--max-budget-usd", max_budget_usd],
+        args,
         timeout_s=timeout_s,
     )
-    if res.exit_code != 0:
-        msg = safe_tail(res.stderr, max_stderr_chars).strip()
-        if not msg:
-            # Claude Code emits structured errors on stdout in JSON mode.
-            last_line = ""
-            for line in res.stdout.splitlines()[::-1]:
-                if line.strip():
-                    last_line = line.strip()
-                    break
-            if last_line:
-                try:
-                    parsed = json.loads(last_line)
-                except Exception:
-                    parsed = None
-                if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
-                    msg = safe_tail(parsed["result"], max_stderr_chars).strip()
-            if not msg:
-                msg = safe_tail(res.stdout, max_stderr_chars).strip()
+    # Claude Code may exit 0 while reporting an auth error in JSON output.
+    parsed = None
+    last_line = ""
+    for line in res.stdout.splitlines()[::-1]:
+        if line.strip():
+            last_line = line.strip()
+            break
+    if last_line:
+        try:
+            parsed = json.loads(last_line)
+        except Exception:
+            parsed = None
 
-        if "oauth token" in msg.lower() or "authentication_error" in msg.lower():
+    parsed_is_error = isinstance(parsed, dict) and parsed.get("is_error") is True
+
+    if res.exit_code != 0 or parsed_is_error:
+        msg = safe_tail(res.stderr, max_stderr_chars).strip()
+        if not msg and isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
+            msg = safe_tail(parsed["result"], max_stderr_chars).strip()
+        if not msg:
+            msg = safe_tail(res.stdout, max_stderr_chars).strip()
+
+        lower = msg.lower()
+        if "invalid api key" in lower or "please run /login" in lower:
+            msg = f"{msg} (Fix: run `claude setup-token` (preferred) or open `claude` and run `/login` once as the service user.)"
+        elif "oauth token" in lower or "authentication_error" in lower:
             msg = f"{msg} (Fix: run `claude setup-token` or open `claude` and re-auth.)"
 
         errors.append(
             {
-                "command": "claude refresh",
+                "command": "claude -p ping",
                 "exitCode": res.exit_code,
                 "message": msg or f"Exit {res.exit_code}",
             }
         )
+
+
+def annotate_claude_usage_errors(items: list[Any]) -> None:
+    """
+    CodexBar Claude usage relies on the Claude OAuth token. When it's missing,
+    CodexBar returns a generic "No available fetch strategy" error which isn't
+    actionable in the dashboard. Add a short fix hint.
+    """
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("provider") != "claude":
+            continue
+        err = item.get("error")
+        if not isinstance(err, dict):
+            continue
+        msg = str(err.get("message") or "").strip()
+        if not msg:
+            continue
+        if "no available fetch strategy for claude" in msg.lower():
+            err["message"] = (
+                "No available fetch strategy for claude. "
+                "Fix: run `claude setup-token` once on this machine as the same user that runs the stats updater."
+            )
+
+
+def has_claude_fetch_strategy_error(items: list[Any]) -> bool:
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("provider") != "claude":
+            continue
+        err = item.get("error")
+        if not isinstance(err, dict):
+            continue
+        msg = str(err.get("message") or "").lower()
+        if "no available fetch strategy for claude" in msg:
+            return True
+    return False
 
 
 def parse_json_arrays(stdout: str, *, errors: list[dict[str, Any]], context: str) -> list[Any]:
@@ -222,6 +287,16 @@ def load_history(path: Path) -> list[dict[str, Any]]:
         return []
 
 
+def load_json(path: Path) -> Any | None:
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def parse_iso_datetime(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -250,6 +325,194 @@ def parse_iso_datetime(value: Any) -> datetime | None:
         except Exception:
             return None
     return None
+
+
+def read_tail_lines(path: Path, *, max_bytes: int) -> list[str]:
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            start = max(0, end - max_bytes)
+            f.seek(start)
+            chunk = f.read(end - start)
+    except Exception:
+        return []
+
+    if start > 0:
+        nl = chunk.find(b"\n")
+        if nl >= 0:
+            chunk = chunk[nl + 1 :]
+        else:
+            return []
+
+    text = chunk.decode("utf-8", errors="replace")
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def is_claude_model(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("claude-")
+
+
+def discover_clawdbot_state_dirs() -> list[Path]:
+    candidates: list[Path] = []
+    for base in (Path("/root"), Path("/home/web"), Path("/root/ClawBridgeGateway/state")):
+        if not base.exists():
+            continue
+        for child in base.glob(".clawdbot*"):
+            if child.is_dir():
+                candidates.append(child)
+        for child in base.glob(".clawdbot-state*"):
+            if child.is_dir():
+                candidates.append(child)
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for d in candidates:
+        try:
+            key = str(d.resolve())
+        except Exception:
+            key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def find_last_claude_cli_event(*, home: Path, exclude_project_dirs: set[Path], max_files: int, max_bytes: int) -> dict[str, Any] | None:
+    projects_dir = home / ".claude" / "projects"
+    history_file = home / ".claude" / "history.jsonl"
+
+    candidates: list[Path] = []
+    if projects_dir.is_dir():
+        candidates.extend(projects_dir.glob("**/*.jsonl"))
+    if history_file.is_file():
+        candidates.append(history_file)
+
+    candidates = [p for p in candidates if p.is_file() and p.suffix == ".jsonl"]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if max_files > 0:
+        candidates = candidates[:max_files]
+
+    best: dict[str, Any] | None = None
+    for path in candidates:
+        if any(excl in path.parents for excl in exclude_project_dirs):
+            continue
+
+        for line in reversed(read_tail_lines(path, max_bytes=max_bytes)):
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            msg = entry.get("message")
+            if not isinstance(msg, dict):
+                continue
+            model = msg.get("model")
+            if not is_claude_model(model):
+                continue
+            ts = parse_iso_datetime(entry.get("timestamp")) or parse_iso_datetime(msg.get("timestamp"))
+            if ts is None:
+                continue
+            item = {
+                "tsUtc": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "source": "cli",
+                "provider": "claude-cli",
+                "model": str(model),
+                "path": str(path),
+                "cwd": entry.get("cwd") if isinstance(entry.get("cwd"), str) else None,
+            }
+            if best is None or str(item["tsUtc"]) > str(best.get("tsUtc")):
+                best = item
+            break
+
+    return best
+
+
+def find_last_claude_bot_event(*, state_dirs: list[Path], max_files: int, max_bytes: int) -> dict[str, Any] | None:
+    candidates: list[Path] = []
+    for state_dir in state_dirs:
+        agents_dir = state_dir / "agents"
+        if not agents_dir.is_dir():
+            continue
+        candidates.extend(sorted(agents_dir.glob("*/sessions/*.jsonl")))
+
+    candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    if max_files > 0:
+        candidates = candidates[:max_files]
+
+    best: dict[str, Any] | None = None
+    for path in candidates:
+        for line in reversed(read_tail_lines(path, max_bytes=max_bytes)):
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "message":
+                continue
+            msg = entry.get("message")
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+
+            provider = msg.get("provider") or entry.get("provider")
+            model = msg.get("model") or entry.get("model")
+            provider_value = str(provider or "").strip().lower()
+            if not (is_claude_model(model) or provider_value in ("anthropic", "claude")):
+                continue
+
+            ts = parse_iso_datetime(entry.get("timestamp")) or parse_iso_datetime(msg.get("timestamp"))
+            if ts is None:
+                continue
+
+            item = {
+                "tsUtc": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "source": "bots",
+                "provider": str(provider) if isinstance(provider, str) else None,
+                "model": str(model) if isinstance(model, str) else None,
+                "path": str(path),
+            }
+            if best is None or str(item["tsUtc"]) > str(best.get("tsUtc")):
+                best = item
+            break
+
+    return best
+
+
+def compute_last_claude_activity(*, max_files: int, max_bytes: int) -> dict[str, Any]:
+    exclude_refresh = {Path("/root/.claude/projects/-home-mlweb-stats-lucheestiy-com")}
+    cli_root = find_last_claude_cli_event(
+        home=Path("/root"),
+        exclude_project_dirs=exclude_refresh,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    cli_web = find_last_claude_cli_event(
+        home=Path("/home/web"),
+        exclude_project_dirs=set(),
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    bots = find_last_claude_bot_event(
+        state_dirs=discover_clawdbot_state_dirs(),
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+
+    candidates = [c for c in (cli_root, cli_web, bots) if isinstance(c, dict) and isinstance(c.get("tsUtc"), str)]
+    overall = None
+    if candidates:
+        overall = max(candidates, key=lambda d: str(d.get("tsUtc") or ""))
+
+    return {
+        "generatedAt": utc_now_iso(),
+        "cli": {"root": cli_root, "web": cli_web},
+        "bots": bots,
+        "overall": overall,
+        "excluded": {"refreshProject": "/root/.claude/projects/-home-mlweb-stats-lucheestiy-com"},
+    }
 
 
 def to_ymd_in_tz(dt_utc: datetime, tz_name: str) -> str:
@@ -729,6 +992,14 @@ def compute_direct_claude_minimax_usage(
     if minimax_custom_home.is_dir():
         claude_dirs.append(minimax_custom_home)
 
+    # Add web user's claude directory
+    web_claude = Path("/home/web/.claude")
+    if web_claude.is_dir():
+        claude_dirs.append(web_claude)
+
+    # Add droid (factory) sessions directory
+    factory_sessions = Path.home() / ".factory"
+
     # Find all JSONL files in all claude directories
     jsonl_files = []
     for claude_dir in claude_dirs:
@@ -736,6 +1007,12 @@ def compute_direct_claude_minimax_usage(
             continue
         jsonl_files.extend(claude_dir.glob("*.jsonl"))
         jsonl_files.extend(claude_dir.glob("projects/*/*.jsonl"))
+        # Also scan subagent directories
+        jsonl_files.extend(claude_dir.glob("projects/*/*/subagents/*.jsonl"))
+
+    # Also scan droid/factory sessions (different structure: sessions/*/*.jsonl)
+    if factory_sessions.is_dir():
+        jsonl_files.extend(factory_sessions.glob("sessions/*/*.jsonl"))
 
     if not jsonl_files:
         return None
@@ -820,6 +1097,74 @@ def compute_direct_claude_minimax_usage(
                     "command": "direct claude cli scan",
                     "exitCode": 1,
                     "message": safe_tail(str(e), max_stderr_chars) or "Failed to scan Claude CLI logs",
+                }
+            )
+
+    # Also scan droid/factory .settings.json files (usage stored separately from sessions)
+    if factory_sessions.is_dir():
+        try:
+            for settings_path in factory_sessions.glob("sessions/*/*.settings.json"):
+                try:
+                    st = settings_path.stat()
+                except Exception:
+                    continue
+                if st.st_mtime < window_start_s:
+                    continue
+
+                try:
+                    with open(settings_path, "r", encoding="utf-8", errors="replace") as f:
+                        data = json.load(f)
+                except Exception:
+                    continue
+
+                if not isinstance(data, dict):
+                    continue
+
+                model = data.get("model", "")
+                if not model or "minimax" not in str(model).lower():
+                    continue
+
+                token_usage = data.get("tokenUsage")
+                if not isinstance(token_usage, dict):
+                    continue
+
+                # Get timestamp from providerLockTimestamp or file mtime
+                timestamp = data.get("providerLockTimestamp")
+                if timestamp:
+                    dt_utc = parse_iso_datetime(timestamp)
+                    if dt_utc:
+                        ts = dt_utc.timestamp()
+                        if ts < window_start_s or ts >= window_end_s:
+                            continue
+
+                # Extract tokens (droid format)
+                input_tokens = as_finite_number(token_usage.get("inputTokens"))
+                output_tokens = as_finite_number(token_usage.get("outputTokens"))
+                cache_read = as_finite_number(token_usage.get("cacheReadTokens"))
+                cache_write = as_finite_number(token_usage.get("cacheCreationTokens"))
+
+                total_tokens = (input_tokens or 0.0) + (output_tokens or 0.0) + (cache_read or 0.0) + (cache_write or 0.0)
+
+                if input_tokens is None and output_tokens is None and cache_read is None and cache_write is None:
+                    totals["missingCostEntries"] += 1.0
+                    cost_total = 0.0
+                else:
+                    cost_total = compute_minimax_cost_usd(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cache_read_tokens=cache_read,
+                        cache_write_tokens=cache_write,
+                    )
+
+                totals["totalTokens"] += total_tokens
+                totals["totalCost"] += cost_total
+
+        except Exception as e:
+            errors.append(
+                {
+                    "command": "droid factory scan",
+                    "exitCode": 1,
+                    "message": safe_tail(str(e), max_stderr_chars) or "Failed to scan droid sessions",
                 }
             )
 
@@ -946,6 +1291,73 @@ def merge_cost_items_by_provider(base: list[Any], delta: dict[str, Any], provide
     target_daily.sort(key=lambda d: d.get("date") or "")
 
 
+def fill_missing_cost_days(cost_items: list[Any], *, tz_name: str, days: int) -> None:
+    """
+    CodexBar cost output omits days with 0 usage, which makes charts/ranges
+    look like data is missing (especially near "today"). Fill explicit zero
+    entries for the last N days in the target timezone.
+    """
+    if not isinstance(days, int) or days <= 0:
+        return
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    end_date = now_utc.astimezone(tz).date()
+    start_date = end_date - timedelta(days=days - 1)
+    required_dates = [(start_date + timedelta(days=i)).isoformat() for i in range(days)]
+    required_set = set(required_dates)
+
+    for item in cost_items:
+        if not isinstance(item, dict):
+            continue
+        daily = item.get("daily")
+        if not isinstance(daily, list):
+            continue
+
+        by_date: dict[str, dict[str, Any]] = {}
+        extras: list[dict[str, Any]] = []
+        for d in daily:
+            if not isinstance(d, dict):
+                continue
+            date = d.get("date")
+            if not isinstance(date, str) or not date:
+                continue
+            if date in required_set:
+                # Keep the first entry for each day (should be unique after merges).
+                by_date.setdefault(date, d)
+            else:
+                extras.append(d)
+
+        filled: list[dict[str, Any]] = []
+        for date in required_dates:
+            existing = by_date.get(date)
+            if existing is not None:
+                filled.append(existing)
+                continue
+
+            filled.append(
+                {
+                    "date": date,
+                    "inputTokens": 0.0,
+                    "outputTokens": 0.0,
+                    "cacheReadTokens": 0.0,
+                    "cacheCreationTokens": 0.0,
+                    "totalTokens": 0.0,
+                    "totalCost": 0.0,
+                    "modelBreakdowns": [],
+                    "modelsUsed": [],
+                }
+            )
+
+        merged_daily = extras + filled
+        merged_daily.sort(key=lambda d: str(d.get("date") or ""))
+        item["daily"] = merged_daily
+
+
 def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], generated_at: str, current_codex_account: str | None = None) -> None:
     """
     Track hourly usage history for heatmap visualization.
@@ -1063,6 +1475,41 @@ def main() -> int:
     cost_timeout_s = int(os.environ.get("COST_TIMEOUT_S", "180"))
     max_stderr_chars = int(os.environ.get("MAX_STDERR_CHARS", "4000"))
 
+    # Local Claude activity (read-only) is used to decide whether a costly
+    # `claude -p ...` refresh is actually worth doing.
+    try:
+        claude_activity_max_files = int(os.environ.get("CLAUDE_ACTIVITY_MAX_FILES", "250"))
+    except Exception:
+        claude_activity_max_files = 250
+    try:
+        claude_activity_max_bytes = int(os.environ.get("CLAUDE_ACTIVITY_MAX_BYTES", "256000"))
+    except Exception:
+        claude_activity_max_bytes = 256000
+    claude_activity = compute_last_claude_activity(max_files=claude_activity_max_files, max_bytes=claude_activity_max_bytes)
+
+    # Claude refresh gating state (stored locally, no secrets).
+    claude_refresh_state_path = data_dir / ".claude-refresh-state.json"
+    claude_refresh_state = load_json(claude_refresh_state_path)
+    if not isinstance(claude_refresh_state, dict):
+        claude_refresh_state = {}
+    claude_refresh_policy = str(os.environ.get("CLAUDE_REFRESH_POLICY", "if-new-activity")).strip().lower() or "if-new-activity"
+    try:
+        claude_refresh_min_interval_s = int(os.environ.get("CLAUDE_REFRESH_MIN_INTERVAL_S", "1800"))
+    except Exception:
+        claude_refresh_min_interval_s = 1800
+    if claude_refresh_min_interval_s < 0:
+        claude_refresh_min_interval_s = 0
+    claude_refresh_meta: dict[str, Any] = {
+        "policy": claude_refresh_policy,
+        "minIntervalSec": claude_refresh_min_interval_s,
+        "attempted": False,
+        "skipped": False,
+        "reason": "",
+        "lastActivityAt": (claude_activity.get("overall") or {}).get("tsUtc") if isinstance(claude_activity, dict) else None,
+        "lastUsageOkAt": claude_refresh_state.get("lastClaudeUsageOkAt"),
+        "lastRefreshAttemptAt": claude_refresh_state.get("lastClaudeRefreshAttemptAt"),
+    }
+
     codex_accounts_dir = Path(os.environ.get("CODEX_ACCOUNTS_DIR", str(Path.home() / ".codex" / "accounts")))
     codex_config_toml = Path(os.environ.get("CODEX_CONFIG_TOML", str(Path.home() / ".codex" / "config.toml")))
     selected_accounts = parse_accounts_env(os.environ.get("CODEX_AUTH_ACCOUNTS", ""))
@@ -1085,7 +1532,16 @@ def main() -> int:
 
     exit_codes: dict[str, Any] = {"usage": {"codex": {}, "claude": None, "gemini": None, "minimax": None}, "cost": None}
 
-    minimax_state_dir = Path(os.environ.get("CLAWDBOT_MINIMAX_STATE_DIR", str(Path.home() / ".clawdbot-minimax")))
+    # Support multiple clawdbot state directories for minimax
+    minimax_state_dirs_env = os.environ.get("CLAWDBOT_MINIMAX_STATE_DIRS", "")
+    if minimax_state_dirs_env.strip():
+        minimax_state_dirs = [Path(p.strip()) for p in minimax_state_dirs_env.split(":") if p.strip()]
+    else:
+        # Default: scan common minimax clawdbot profiles
+        minimax_state_dirs = [
+            Path(os.environ.get("CLAWDBOT_MINIMAX_STATE_DIR", str(Path.home() / ".clawdbot-clawdminimaxbot"))),
+            Path.home() / ".clawdbot-minimax",
+        ]
     try:
         minimax_session_budget_usd = float(os.environ.get("MINIMAX_SESSION_BUDGET_USD", "50"))
     except Exception:
@@ -1172,15 +1628,76 @@ def main() -> int:
         timeout_s=usage_timeout_s,
         env=base_env,
     )
-    if is_claude_oauth_token_expired(claude_res):
-        refresh_claude_oauth_token(errors=errors, max_stderr_chars=max_stderr_chars)
-        claude_res = run_cmd(
-            [codexbar_bin, "usage", "--provider", "claude", "--format", "json", "--json-only"],
-            timeout_s=usage_timeout_s,
-            env=base_env,
+    claude_parsed = parse_json_arrays(claude_res.stdout, errors=errors, context="usage.claude")
+    claude_needs_refresh = is_claude_oauth_token_expired(claude_res) or has_claude_fetch_strategy_error(claude_parsed)
+    if claude_needs_refresh:
+        now_utc = datetime.now(timezone.utc)
+        last_activity_ts = None
+        if isinstance(claude_activity, dict):
+            overall = claude_activity.get("overall")
+            if isinstance(overall, dict):
+                last_activity_ts = parse_iso_datetime(overall.get("tsUtc"))
+        last_ok_ts = parse_iso_datetime(claude_refresh_state.get("lastClaudeUsageOkAt"))
+        last_attempt_ts = parse_iso_datetime(claude_refresh_state.get("lastClaudeRefreshAttemptAt"))
+
+        has_new_activity = last_activity_ts is not None and (last_ok_ts is None or last_activity_ts > last_ok_ts)
+        recent_attempt = (
+            last_attempt_ts is not None and (now_utc - last_attempt_ts).total_seconds() < float(claude_refresh_min_interval_s)
         )
+
+        allow_refresh = False
+        reason = ""
+
+        if claude_refresh_policy in ("never", "off", "disabled", "0", "false"):
+            allow_refresh = False
+            reason = "policy=never"
+        elif recent_attempt:
+            allow_refresh = False
+            reason = f"recent refresh attempt ({claude_refresh_min_interval_s}s cooldown)"
+        elif claude_refresh_policy in ("always", "force"):
+            allow_refresh = True
+            reason = "policy=always"
+        elif claude_refresh_policy in ("on-activity", "activity-window"):
+            try:
+                window_min = int(os.environ.get("CLAUDE_REFRESH_ACTIVITY_WINDOW_MINUTES", "360"))
+            except Exception:
+                window_min = 360
+            if window_min < 0:
+                window_min = 0
+            if last_activity_ts is None:
+                allow_refresh = False
+                reason = "no local Claude activity found"
+            else:
+                age_s = (now_utc - last_activity_ts).total_seconds()
+                allow_refresh = age_s <= float(window_min) * 60.0
+                reason = f"activity age {int(age_s)}s (window {window_min}m)"
+        else:
+            # Default: refresh only if there was local Claude activity since last successful Claude usage fetch.
+            allow_refresh = bool(has_new_activity)
+            if last_activity_ts is None:
+                reason = "no local Claude activity found"
+            elif has_new_activity:
+                reason = "new local Claude activity since last ok usage fetch"
+            else:
+                reason = "no new local Claude activity since last ok usage fetch"
+
+        if allow_refresh:
+            claude_refresh_meta["attempted"] = True
+            claude_refresh_meta["reason"] = reason
+            claude_refresh_state["lastClaudeRefreshAttemptAt"] = utc_now_iso()
+            claude_refresh_state["lastClaudeRefreshAttemptReason"] = reason
+            refresh_claude_oauth_token(errors=errors, max_stderr_chars=max_stderr_chars)
+            claude_res = run_cmd(
+                [codexbar_bin, "usage", "--provider", "claude", "--format", "json", "--json-only"],
+                timeout_s=usage_timeout_s,
+                env=base_env,
+            )
+        else:
+            claude_refresh_meta["skipped"] = True
+            claude_refresh_meta["reason"] = reason
     exit_codes["usage"]["claude"] = claude_res.exit_code
     claude_parsed = parse_json_arrays(claude_res.stdout, errors=errors, context="usage.claude")
+    annotate_claude_usage_errors(claude_parsed)
     claude_has_provider_error = any(isinstance(item, dict) and isinstance(item.get("error"), dict) for item in claude_parsed)
     if claude_res.stderr.strip() or (claude_res.exit_code != 0 and not claude_has_provider_error):
         errors.append(
@@ -1193,6 +1710,12 @@ def main() -> int:
     for item in claude_parsed:
         if isinstance(item, dict) and item.get("provider") != "cli":
             usage_items.append(item)
+
+    # Record last known-good Claude usage fetch time (for refresh gating).
+    if not claude_has_provider_error and claude_res.exit_code == 0:
+        claude_refresh_state["lastClaudeUsageOkAt"] = generated_at
+        if claude_refresh_meta.get("attempted") is True:
+            claude_refresh_state["lastClaudeRefreshOkAt"] = generated_at
 
     # --- Gemini usage (API via Gemini CLI credentials)
     gemini_res = run_cmd(
@@ -1215,16 +1738,34 @@ def main() -> int:
         if isinstance(item, dict) and item.get("provider") != "cli":
             usage_items.append(item)
 
-    # --- MiniMax usage from Clawdbot profile: `clawdbot --profile minimax`
-    minimax_usage = compute_clawdbot_window_usage(
-        provider="minimax",
-        state_dir=minimax_state_dir,
-        window_minutes=minimax_session_window_minutes,
-        budget_usd=minimax_session_budget_usd,
-        reset_offset_minutes=minimax_session_reset_offset_minutes,
-        errors=errors,
-        max_stderr_chars=max_stderr_chars,
-    )
+    # --- MiniMax usage from Clawdbot profiles (scan multiple directories)
+    combined_clawdbot_totals = {"totalTokens": 0.0, "totalCost": 0.0, "missingCostEntries": 0.0}
+    minimax_usage = None
+    for state_dir in minimax_state_dirs:
+        if not state_dir.is_dir():
+            continue
+        result = compute_clawdbot_window_usage(
+            provider="minimax",
+            state_dir=state_dir,
+            window_minutes=minimax_session_window_minutes,
+            budget_usd=minimax_session_budget_usd,
+            reset_offset_minutes=minimax_session_reset_offset_minutes,
+            errors=errors,
+            max_stderr_chars=max_stderr_chars,
+        )
+        if result and isinstance(result.get("window"), dict):
+            combined_clawdbot_totals["totalTokens"] += result["window"].get("totalTokens", 0.0)
+            combined_clawdbot_totals["totalCost"] += result["window"].get("totalCostUSD", 0.0)
+            combined_clawdbot_totals["missingCostEntries"] += result["window"].get("missingCostEntries", 0.0)
+            minimax_usage = result  # Keep last result as template
+
+    # Update minimax_usage with combined totals
+    if minimax_usage and isinstance(minimax_usage.get("window"), dict):
+        minimax_usage["window"]["totalTokens"] = combined_clawdbot_totals["totalTokens"]
+        minimax_usage["window"]["totalCostUSD"] = combined_clawdbot_totals["totalCost"]
+        minimax_usage["window"]["missingCostEntries"] = combined_clawdbot_totals["missingCostEntries"]
+        if minimax_session_budget_usd > 0:
+            minimax_usage["primary"]["usedPercent"] = (combined_clawdbot_totals["totalCost"] / minimax_session_budget_usd) * 100.0
 
     # --- MiniMax usage from direct Claude CLI: `claude --model minimax`
     direct_minimax_usage = compute_direct_claude_minimax_usage(
@@ -1235,62 +1776,49 @@ def main() -> int:
         max_stderr_chars=max_stderr_chars,
     )
 
-    # Merge both Clawdbot and direct CLI usage
+    # Combine clawdbot-minimax and direct-cli into a single minimax entry
+    combined_minimax_tokens = 0.0
+    combined_minimax_cost = 0.0
+    combined_minimax_missing = 0.0
+
+    if minimax_usage and isinstance(minimax_usage.get("window"), dict):
+        combined_minimax_tokens += minimax_usage["window"].get("totalTokens", 0.0)
+        combined_minimax_cost += minimax_usage["window"].get("totalCostUSD", 0.0)
+        combined_minimax_missing += minimax_usage["window"].get("missingCostEntries", 0.0)
+
+    if direct_minimax_usage and isinstance(direct_minimax_usage.get("window"), dict):
+        combined_minimax_tokens += direct_minimax_usage["window"].get("totalTokens", 0.0)
+        combined_minimax_cost += direct_minimax_usage["window"].get("totalCostUSD", 0.0)
+        combined_minimax_missing += direct_minimax_usage["window"].get("missingCostEntries", 0.0)
+
     if minimax_usage or direct_minimax_usage:
-        combined_usage = {
+        # Use whichever result we have as a template
+        base_usage = minimax_usage or direct_minimax_usage
+        combined_percent = (combined_minimax_cost / minimax_session_budget_usd * 100.0) if minimax_session_budget_usd > 0 else 0.0
+
+        usage_items.append({
             "provider": "minimax",
-            "source": "claude-cli+clawdbot",
-            "version": "both",
-            "usage": {}
-        }
-
-        # Combine usage data
-        if minimax_usage and direct_minimax_usage:
-            # Merge percentages and costs
-            claw_pct = minimax_usage.get("primary", {}).get("usedPercent", 0)
-            direct_pct = direct_minimax_usage.get("primary", {}).get("usedPercent", 0)
-            combined_pct = claw_pct + direct_pct
-
-            combined_usage["usage"] = {
+            "source": "combined",
+            "usage": {
+                "updatedAt": base_usage.get("updatedAt"),
+                "identity": base_usage.get("identity"),
                 "primary": {
-                    "usedPercent": combined_pct,
-                    "resetsAt": minimax_usage.get("primary", {}).get("resetsAt"),
+                    "usedPercent": combined_percent,
+                    "resetsAt": base_usage.get("primary", {}).get("resetsAt"),
                     "windowMinutes": minimax_session_window_minutes,
                 },
                 "secondary": None,
                 "tertiary": None,
-                "loginMethod": "Coding subscription (${budget:g})",
-                "identity": {
-                    "loginMethod": "Coding subscription (${budget:g})",
-                    "providerID": "minimax",
-                }
-            }
-        elif minimax_usage:
-            combined_usage["usage"] = minimax_usage
-        else:
-            combined_usage["usage"] = direct_minimax_usage
-
-        usage_items.append(combined_usage)
-        exit_codes["usage"]["minimax"] = 0
-    elif minimax_usage:
-        usage_items.append(
-            {
-                "provider": "minimax",
-                "source": "clawdbot-minimax",
-                "version": "clawdbot",
-                "usage": minimax_usage,
-            }
-        )
-        exit_codes["usage"]["minimax"] = 0
-    elif direct_minimax_usage:
-        usage_items.append(
-            {
-                "provider": "minimax",
-                "source": "direct-cli",
-                "version": "direct",
-                "usage": direct_minimax_usage,
-            }
-        )
+                "loginMethod": base_usage.get("loginMethod"),
+                "window": {
+                    "budgetUSD": minimax_session_budget_usd,
+                    "totalCostUSD": combined_minimax_cost,
+                    "totalTokens": combined_minimax_tokens,
+                    "missingCostEntries": combined_minimax_missing,
+                    "resetOffsetMinutes": minimax_session_reset_offset_minutes,
+                },
+            },
+        })
         exit_codes["usage"]["minimax"] = 0
 
     # Record provider-level JSON errors even if the command exited 0.
@@ -1398,7 +1926,7 @@ def main() -> int:
         max_stderr_chars=max_stderr_chars,
         provider="minimax",
         source="clawdbot-minimax",
-        state_dir=minimax_state_dir,
+        state_dir=minimax_state_dirs[0] if minimax_state_dirs else Path.home() / ".clawdbot-minimax",
         match_providers=("minimax",),
     )
     minimax_cost_ru = compute_clawdbot_cost_delta(
@@ -1408,7 +1936,7 @@ def main() -> int:
         max_stderr_chars=max_stderr_chars,
         provider="minimax",
         source="clawdbot-minimax",
-        state_dir=minimax_state_dir,
+        state_dir=minimax_state_dirs[0] if minimax_state_dirs else Path.home() / ".clawdbot-minimax",
         match_providers=("minimax",),
     )
     if minimax_cost_en:
@@ -1640,6 +2168,11 @@ def main() -> int:
     if direct_minimax_cost_ru:
         merge_cost_items_by_provider(cost_items_ru, direct_minimax_cost_ru, "minimax")
 
+    # Ensure the chart range always includes the last 30 calendar days,
+    # even if there was no usage on some days.
+    fill_missing_cost_days(cost_items_en, tz_name="America/New_York", days=30)
+    fill_missing_cost_days(cost_items_ru, tz_name="Europe/Minsk", days=30)
+
     # Back-compat: keep the original `cost` field in EN (New York).
     cost_items = cost_items_en
 
@@ -1651,6 +2184,8 @@ def main() -> int:
         "generatedAt": generated_at,
         "hostname": hostname,
         "currentCodexAccount": current_codex_account,
+        "claudeActivity": claude_activity,
+        "claudeRefresh": claude_refresh_meta,
         "usage": usage_items,
         "cost": cost_items,
         "costByLang": {
@@ -1669,6 +2204,7 @@ def main() -> int:
 
     atomic_write_json(data_dir / "latest.json", latest)
     atomic_write_json(data_dir / "last-run.json", last_run)
+    atomic_write_json(claude_refresh_state_path, claude_refresh_state)
 
     # Update hourly history for heatmap (only current codex account)
     update_hourly_history(data_dir, usage_items, generated_at, current_codex_account)
