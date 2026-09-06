@@ -38,10 +38,10 @@ Static dashboard that publishes CodexBar CLI output (`codexbar`) on `https://sta
   - Verify Tailscale connectivity from droplet: `ssh droplet 'curl -fsSI http://100.93.127.52:8117/ | head'`
 
 ## Notes
-- Usage providers currently included: Codex, Claude, Gemini.
+- Usage providers currently included: Codex, Claude, Antigravity.
 - Codex usage is collected for **all `codex-auth` profiles** found under `/root/.codex/accounts/*.json` and each Codex entry includes `codexAuthAccount`.
-- This install is currently limited to: `tmr,pr,rl,kr,sn` (configured via `CODEX_AUTH_ACCOUNTS` in `/etc/systemd/system/codexbar-stats.service`).
+- This install is currently limited to: `tmr,pr,rl,kr` (configured via `CODEX_AUTH_ACCOUNTS` in `/etc/systemd/system/codexbar-stats.service`; `sn` is temporarily excluded until re-authenticated).
 - Emails (`accountEmail`) are stripped before publishing `data/latest.json` and the UI shows Codex profile names instead.
-- `codexbar cost` only supports Codex + Claude (Gemini cost is not available via CodexBar).
+- `codexbar cost` only supports Codex + Claude (Antigravity cost is not available via CodexBar).
 - Cost is **not separable per `codex-auth` profile** with CodexBar today; it’s computed by scanning local logs and does not carry per-profile/account attribution, so the Codex cost numbers are shared/aggregated.
 - Claude cost on the dashboard merges **CodexBar Claude logs + Clawdbot session transcripts** (so Claude usage via `clawdbot` shows up under Claude cost).

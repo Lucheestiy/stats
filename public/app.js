@@ -66,7 +66,11 @@ const i18n = {
     vsLastWeek: "vs last week",
     minutesAgo: "min ago",
     hoursAgo: "hr ago",
-    justNow: "just now"
+    justNow: "just now",
+    tokenExpires: "Token expires",
+    authRefreshed: "Auth refreshed",
+    expiresIn: "expires in",
+    expired: "expired"
   },
   ru: {
     title: "Панель CodexBar",
@@ -118,7 +122,11 @@ const i18n = {
     vsLastWeek: "к прошлой неделе",
     minutesAgo: "мин назад",
     hoursAgo: "ч назад",
-    justNow: "только что"
+    justNow: "только что",
+    tokenExpires: "Токен истекает",
+    authRefreshed: "Auth обновлена",
+    expiresIn: "через",
+    expired: "истёк"
   }
 };
 
@@ -129,12 +137,15 @@ const hostEl = document.getElementById("host");
 const currentAccountEl = document.getElementById("currentAccount");
 const providersEl = document.getElementById("providers");
 const costEl = document.getElementById("cost");
+const costTitleEl = costEl?.previousElementSibling || null;
 const errorsEl = document.getElementById("errors");
 const rawJsonEl = document.getElementById("rawJson");
 const heatmapEl = document.getElementById("heatmap");
 const heatmapDetailEl = document.getElementById("heatmapDetail");
 const statsSummaryEl = document.getElementById("statsSummary");
 const chartCanvas = document.getElementById("costChart");
+const chartSectionEl = document.getElementById("chartSection");
+const costTrendTitleEl = chartSectionEl?.previousElementSibling || null;
 const chartTooltip = document.getElementById("chartTooltip");
 const chartLegend = document.getElementById("chartLegend");
 const langToggle = document.getElementById("langToggle");
@@ -266,6 +277,35 @@ function formatRelativeTime(iso) {
   return "";
 }
 
+function formatDurationShort(ms) {
+  if (!Number.isFinite(ms)) return "";
+  const absMs = Math.abs(ms);
+  const totalMinutes = Math.max(0, Math.floor(absMs / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return `${Math.max(1, minutes)}m`;
+}
+
+function getAuthExpiryMeta(auth) {
+  const expiresMs = parseIsoMs(auth?.accessTokenExpiresAt);
+  if (expiresMs === null) return null;
+  const diffMs = expiresMs - Date.now();
+  let className = "good";
+  if (diffMs <= 0) className = "danger";
+  else if (diffMs <= 24 * 60 * 60 * 1000) className = "danger";
+  else if (diffMs <= 3 * 24 * 60 * 60 * 1000) className = "warning";
+
+  const relative = diffMs <= 0 ? t("expired") : `${t("expiresIn")} ${formatDurationShort(diffMs)}`;
+  return {
+    className,
+    relative,
+    expiresAt: auth.accessTokenExpiresAt,
+  };
+}
+
 function parseIsoMs(iso) {
   if (!iso) return null;
   const d = new Date(iso);
@@ -285,6 +325,35 @@ function formatUsd(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return String(value);
   return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+}
+
+function hasUsableCostAmount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0;
+}
+
+function costEntryHasUsableCost(cost) {
+  if (!cost || typeof cost !== "object") return false;
+  if (hasUsableCostAmount(cost.last30DaysCostUSD)) return true;
+  if (hasUsableCostAmount(cost?.totals?.totalCost)) return true;
+  const daily = Array.isArray(cost?.daily) ? cost.daily : [];
+  return daily.some(day => hasUsableCostAmount(day?.totalCost));
+}
+
+function hasUsableCostData(costData) {
+  return Array.isArray(costData) && costData.some(costEntryHasUsableCost);
+}
+
+function setCostSectionsVisible(visible) {
+  if (costTrendTitleEl) costTrendTitleEl.hidden = !visible;
+  if (chartSectionEl) chartSectionEl.hidden = !visible;
+  if (costTitleEl) costTitleEl.hidden = !visible;
+  if (costEl) costEl.hidden = !visible;
+  if (!visible) {
+    clearCostChart();
+    if (statsSummaryEl) statsSummaryEl.innerHTML = "";
+    if (costEl) costEl.innerHTML = "";
+  }
 }
 
 function formatPercent(value) {
@@ -355,7 +424,7 @@ function getProviderIcon(provider) {
   const p = (provider || "").toLowerCase();
   if (p === "codex") return `<span class="providerIcon codex">C</span>`;
   if (p === "claude") return `<span class="providerIcon claude">A</span>`;
-  if (p === "gemini") return `<span class="providerIcon gemini">G</span>`;
+  if (p === "antigravity") return `<span class="providerIcon antigravity">Ag</span>`;
   return "";
 }
 
@@ -424,9 +493,9 @@ function buildUsageSection(usage, providerId) {
   if (!usage) return `<div class="usageBlock"><div class="k">${t("noUsageData")}</div></div>`;
 
   const blocks = [
-    { key: "primary", title: windowLabel(usage.primary?.windowMinutes) },
-    { key: "secondary", title: windowLabel(usage.secondary?.windowMinutes) },
-    usage.tertiary ? { key: "tertiary", title: windowLabel(usage.tertiary?.windowMinutes) } : null,
+    { key: "primary", title: usage.primary?.label || windowLabel(usage.primary?.windowMinutes) },
+    { key: "secondary", title: usage.secondary?.label || windowLabel(usage.secondary?.windowMinutes) },
+    usage.tertiary ? { key: "tertiary", title: usage.tertiary?.label || windowLabel(usage.tertiary?.windowMinutes) } : null,
   ].filter(Boolean);
 
   const rows = blocks
@@ -566,12 +635,23 @@ function buildProviderCard(providerUsage, idx) {
   const loginMethod = providerUsage.usage?.loginMethod || providerUsage.usage?.identity?.loginMethod || "—";
   const providerError = providerUsage.error?.message || null;
   const providerId = `provider-${idx}`;
+  const auth = providerUsage?.auth && typeof providerUsage.auth === "object" ? providerUsage.auth : null;
+  const expiry = getAuthExpiryMeta(auth);
 
   const isCodex = provider === "codex";
-  const headRight = isCodex ? "" : `<span class="pill">${escapeHtml(source)}</span>`;
+  const headRight = isCodex
+    ? (expiry ? `<span class="pill ${escapeHtml(expiry.className)}">${escapeHtml(expiry.relative)}</span>` : "")
+    : `<span class="pill">${escapeHtml(source)}</span>`;
   const identityLines = [];
   if (!isCodex) {
     identityLines.push(`<div><div class="k">${t("login")}</div><div class="v">${escapeHtml(loginMethod)}</div></div>`);
+  } else if (auth) {
+    if (expiry) {
+      identityLines.push(`<div><div class="k">${escapeHtml(t("tokenExpires"))}</div><div class="v">${escapeHtml(formatIso(expiry.expiresAt))}</div></div>`);
+    }
+    if (auth.lastRefresh) {
+      identityLines.push(`<div><div class="k">${escapeHtml(t("authRefreshed"))}</div><div class="v">${escapeHtml(formatIso(auth.lastRefresh))}</div></div>`);
+    }
   }
 
   const credits = providerUsage.credits?.remaining;
@@ -691,7 +771,7 @@ function drawCostChart(costData) {
   const providerColors = {
     codex: "rgba(56, 217, 150, 0.8)",
     claude: "rgba(204, 120, 92, 0.8)",
-    gemini: "rgba(66, 133, 244, 0.8)"
+    antigravity: "rgba(66, 133, 244, 0.8)"
   };
 
   const providers = [];
@@ -1038,11 +1118,11 @@ function render(data) {
     errorsEl.textContent = "";
   }
 
-  // Stats summary
-  statsSummaryEl.innerHTML = buildStatsSummary(data);
-
   const usage = Array.isArray(data.usage) ? data.usage : [];
   const cost = getCostForCurrentView(data);
+  const hasUsableCost = hasUsableCostData(cost);
+  setCostSectionsVisible(hasUsableCost);
+  statsSummaryEl.innerHTML = hasUsableCost ? buildStatsSummary(data) : "";
 
   const sortedUsage = sortUsage(usage, currentSort);
   providersEl.innerHTML = sortedUsage.map((u, idx) => buildProviderCard(u, idx)).join("");
@@ -1061,10 +1141,10 @@ function render(data) {
     });
   }, 0);
 
-  costEl.innerHTML = cost.length > 0 ? cost.map(c => buildCostCard(c)).join("") : `<div class="card"><div class="k">${t("noCostData")}</div></div>`;
-
-  // Draw cost chart
-  drawCostChart(cost);
+  if (hasUsableCost) {
+    costEl.innerHTML = cost.length > 0 ? cost.map(c => buildCostCard(c)).join("") : `<div class="card"><div class="k">${t("noCostData")}</div></div>`;
+    drawCostChart(cost);
+  }
 
   rawJsonEl.textContent = JSON.stringify(data, null, 2);
 }

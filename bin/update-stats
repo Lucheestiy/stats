@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
+import base64
+import fcntl
+import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import socket
 import signal
 import subprocess
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
@@ -26,6 +33,80 @@ class CmdResult:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fetch_minimax_api_limits() -> dict[str, Any] | None:
+    """
+    Fetch real MiniMax rate limits from the API.
+    Returns dict with usage info or None if fetch fails.
+    """
+    api_key = os.environ.get("MINIMAX_API_KEY", "sk-cp-okvPF0JbL7yuxX1JTpkdWMwYk5Zu3xiEBkaGH3O6uzDrcud8f7yyeZUAQEJhgbJOg26lGFbvrXxOaxAfiyKL0JO63Cd7xlfPdD6SsglNdhvN95Fi9D8RfMg")
+    url = "https://www.minimax.io/v1/api/openplatform/coding_plan/remains"
+    
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "CodexBar-Stats/1.0",
+            },
+            method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        
+        # Check for API errors
+        base_resp = data.get("base_resp", {})
+        if base_resp.get("status_code") != 0:
+            return None
+        
+        model_remains = data.get("model_remains", [])
+        if not model_remains:
+            return None
+        
+        # Use first (usually only) model entry
+        model_data = model_remains[0]
+        
+        total_count = int(model_data.get("current_interval_total_count", 0) or 0)
+        # Despite the field name, current_interval_usage_count from /coding_plan/remains
+        # behaves as a remaining counter (starts at total and decreases with usage).
+        api_remaining_count = int(model_data.get("current_interval_usage_count", 0) or 0)
+        remains_time_seconds = model_data.get("remains_time", 0)
+        start_time_ms = model_data.get("start_time", 0)
+        end_time_ms = model_data.get("end_time", 0)
+        model_name = model_data.get("model_name", "MiniMax-M2")
+        
+        # Calculate derived values
+        remaining_count = max(0, min(total_count, api_remaining_count))
+        usage_count = max(0, total_count - remaining_count)
+        used_percent = round((usage_count / total_count) * 100) if total_count > 0 else 0
+        
+        # Calculate window duration (MiniMax uses 5-hour windows)
+        window_duration_ms = end_time_ms - start_time_ms
+        window_minutes = round(window_duration_ms / (60 * 1000)) if window_duration_ms > 0 else 300
+        
+        # Reset time is end_time
+        resets_at_ms = end_time_ms
+        resets_at = datetime.fromtimestamp(resets_at_ms / 1000, tz=timezone.utc).isoformat()
+        
+        # Calculate time until reset
+        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        time_until_reset_seconds = max(0, int((resets_at_ms - now_ms) / 1000))
+        
+        return {
+            "model_name": model_name,
+            "total_count": total_count,
+            "usage_count": usage_count,
+            "remaining_count": remaining_count,
+            "used_percent": used_percent,
+            "remains_time_seconds": time_until_reset_seconds,
+            "resets_at": resets_at,
+            "window_minutes": window_minutes,
+            "start_time": datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat(),
+            "end_time": datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat(),
+        }
+    except Exception:
+        return None
 
 
 def safe_tail(value: str, max_chars: int) -> str:
@@ -96,13 +177,6 @@ def run_cmd(args: list[str], *, timeout_s: int, env: dict[str, str] | None = Non
         return CmdResult(args=args, exit_code=124, stdout=stdout, stderr=stderr, timeout_s=timeout_s)
     except FileNotFoundError as e:
         return CmdResult(args=args, exit_code=127, stdout="", stderr=str(e), timeout_s=timeout_s)
-
-
-def run_codexbar_claude_guard() -> None:
-    guard_path = Path("/usr/local/sbin/codexbar-claude-guard")
-    if not guard_path.is_file():
-        return
-    run_cmd([str(guard_path)], timeout_s=10)
 
 
 def is_claude_oauth_token_expired(res: CmdResult) -> bool:
@@ -297,6 +371,109 @@ def load_json(path: Path) -> Any | None:
         return None
 
 
+def has_usable_claude_quota(payload: Any) -> bool:
+    if not isinstance(payload, dict) or payload.get("provider") != "claude":
+        return False
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    return any(isinstance(usage.get(window), dict) for window in ("primary", "secondary", "tertiary"))
+
+
+def select_published_claude_usage(
+    candidate: Any,
+    previous: Any,
+    *,
+    generated_at: str,
+    max_stale_seconds: int = 900,
+) -> tuple[dict[str, Any], bool]:
+    """Keep a recent good quota snapshot through short-lived provider failures."""
+    if has_usable_claude_quota(candidate):
+        return candidate, False
+
+    if not has_usable_claude_quota(previous):
+        return candidate, False
+
+    previous_usage = previous.get("usage")
+    previous_updated_at = parse_iso_datetime(previous_usage.get("updatedAt"))
+    generated_dt = parse_iso_datetime(generated_at)
+    if previous_updated_at is None or generated_dt is None:
+        return candidate, False
+    age_seconds = (generated_dt - previous_updated_at).total_seconds()
+    if age_seconds < 0 or age_seconds > max_stale_seconds:
+        return candidate, False
+
+    reason = "Claude usage response did not include quota windows"
+    if isinstance(candidate, dict) and isinstance(candidate.get("error"), dict):
+        reason = str(candidate["error"].get("message") or reason).strip()
+
+    preserved = dict(previous)
+    preserved["stale"] = True
+    preserved["staleAt"] = generated_at
+    preserved["staleReason"] = reason
+    return preserved, True
+
+
+def prune_redundant_usage_snapshot_runs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Remove repeated full-session snapshot artifacts caused by missing prev-state.
+
+    When delta state fails to load, usage-snapshot entries can be recorded every
+    run with `activity == sessionPct` for the same provider/account/sessionPct.
+    Keep the first sample in a flat run and drop the rest.
+    """
+    if not isinstance(history, list) or not history:
+        return []
+
+    def sort_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+        provider = str(entry.get("provider") or "")
+        account = str(entry.get("account") or "")
+        source = str(entry.get("source") or "")
+        ts = str(entry.get("ts") or "")
+        return (provider, account, source, ts)
+
+    cleaned: list[dict[str, Any]] = []
+    last_kept_key: tuple[str, str, str] | None = None
+    last_kept_session_pct: float | None = None
+
+    for entry in sorted(history, key=sort_key):
+        if not isinstance(entry, dict):
+            continue
+
+        source = str(entry.get("source") or "").strip().lower()
+        provider = str(entry.get("provider") or "").strip().lower()
+        account = str(entry.get("account") or "")
+        session_pct = as_finite_number(entry.get("sessionPct"))
+        activity = as_finite_number(entry.get("activity"))
+
+        if (
+            source == "usage-snapshot"
+            and provider
+            and session_pct is not None
+            and activity is not None
+            and session_pct > 0
+            and abs(activity - session_pct) < 0.001
+        ):
+            current_key = (provider, account, source)
+            if last_kept_key == current_key and last_kept_session_pct is not None and abs(session_pct - last_kept_session_pct) < 0.001:
+                continue
+            last_kept_key = current_key
+            last_kept_session_pct = session_pct
+            cleaned.append(entry)
+            continue
+
+        if source == "usage-snapshot":
+            last_kept_key = (provider, account, source)
+            last_kept_session_pct = session_pct
+        else:
+            last_kept_key = None
+            last_kept_session_pct = None
+        cleaned.append(entry)
+
+    cleaned.sort(key=lambda entry: str(entry.get("ts") or ""))
+    return cleaned
+
+
 def parse_iso_datetime(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -327,6 +504,927 @@ def parse_iso_datetime(value: Any) -> datetime | None:
     return None
 
 
+def decode_jwt_payload(token: Any) -> dict[str, Any] | None:
+    if not isinstance(token, str):
+        return None
+    token = token.strip()
+    if not token:
+        return None
+
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+
+    payload = parts[1].strip()
+    if not payload:
+        return None
+
+    padding = "=" * ((4 - (len(payload) % 4)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload + padding)
+    except Exception:
+        return None
+
+    try:
+        parsed = json.loads(decoded.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def codex_profile_identity_key(account_payload: Any) -> str | None:
+    if not isinstance(account_payload, dict):
+        return None
+
+    tokens = account_payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+
+    claims = decode_jwt_payload(tokens.get("id_token")) or decode_jwt_payload(tokens.get("access_token"))
+    if not isinstance(claims, dict):
+        return None
+
+    sub = claims.get("sub")
+    if isinstance(sub, str) and sub.strip():
+        return f"sub:{sub.strip()}"
+
+    email = claims.get("email")
+    if isinstance(email, str) and email.strip():
+        return f"email:{email.strip().lower()}"
+
+    return None
+
+
+def utc_iso_from_epoch_seconds(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        ts = float(value)
+    except Exception:
+        return None
+    if not ts > 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def normalize_utc_iso(value: Any) -> str | None:
+    dt = parse_iso_datetime(value)
+    if dt is None:
+        return None
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def codex_profile_auth_meta(account_payload: Any, *, now: datetime) -> dict[str, Any] | None:
+    if not isinstance(account_payload, dict):
+        return None
+
+    tokens = account_payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+
+    claims = decode_jwt_payload(tokens.get("access_token"))
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    expires_at = utc_iso_from_epoch_seconds(exp)
+
+    meta: dict[str, Any] = {}
+    last_refresh = normalize_utc_iso(account_payload.get("last_refresh"))
+    if last_refresh:
+        meta["lastRefresh"] = last_refresh
+
+    if expires_at:
+        expires_dt = parse_iso_datetime(expires_at)
+        meta["accessTokenExpiresAt"] = expires_at
+        if expires_dt is not None:
+            expires_in = int(round((expires_dt - now).total_seconds()))
+            meta["expiresInSeconds"] = expires_in
+            meta["expired"] = expires_in <= 0
+
+    return meta or None
+
+
+def normalize_codex_reset_credits(value: Any, *, fetched_at: str, stale: bool = False) -> dict[str, Any] | None:
+    """Keep only dashboard-safe, read-only reset-credit metadata."""
+    if not isinstance(value, dict):
+        return None
+
+    try:
+        available_count = max(0, int(value.get("availableCount", 0)))
+    except Exception:
+        available_count = 0
+
+    credits: list[dict[str, Any]] = []
+    raw_credits = value.get("credits")
+    if isinstance(raw_credits, list):
+        for raw in raw_credits:
+            if not isinstance(raw, dict):
+                continue
+            row: dict[str, Any] = {
+                "resetType": str(raw.get("resetType") or "unknown"),
+                "status": str(raw.get("status") or "unknown"),
+            }
+            for source_key, output_key in (("grantedAt", "grantedAt"), ("expiresAt", "expiresAt")):
+                raw_date = raw.get(source_key)
+                value_iso = normalize_utc_iso(raw_date) if isinstance(raw_date, str) else utc_iso_from_epoch_seconds(raw_date)
+                if value_iso:
+                    row[output_key] = value_iso
+            for key in ("title", "description"):
+                text = raw.get(key)
+                if isinstance(text, str) and text.strip():
+                    row[key] = text.strip()[:500]
+            credits.append(row)
+
+    credits.sort(key=lambda row: str(row.get("expiresAt") or "9999"))
+    return {
+        "availableCount": available_count,
+        "credits": credits,
+        "checkedAt": fetched_at,
+        "stale": bool(stale),
+        "readOnly": True,
+    }
+
+
+def fetch_codex_reset_credits(*, codex_bin: str, env: dict[str, str], timeout_s: int) -> tuple[dict[str, Any] | None, str | None]:
+    """Read reset credits through Codex app-server; never calls the consume method."""
+    proc: subprocess.Popen[str] | None = None
+    selector = selectors.DefaultSelector()
+    try:
+        proc = subprocess.Popen(
+            [codex_bin, "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            start_new_session=True,
+        )
+        if proc.stdin is None or proc.stdout is None:
+            return None, "Codex app-server stdio unavailable"
+
+        selector.register(proc.stdout, selectors.EVENT_READ)
+
+        def send(payload: dict[str, Any]) -> None:
+            assert proc is not None and proc.stdin is not None
+            proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            proc.stdin.flush()
+
+        def receive(request_id: int, deadline: float) -> dict[str, Any] | None:
+            while time.monotonic() < deadline:
+                events = selector.select(max(0.0, deadline - time.monotonic()))
+                if not events:
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    message = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(message, dict) and message.get("id") == request_id:
+                    return message
+            return None
+
+        deadline = time.monotonic() + max(3, timeout_s)
+        send(
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "ai-usage-reset-reader", "version": "1.0"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
+        initialized = receive(1, deadline)
+        if not initialized or initialized.get("error"):
+            return None, "Codex app-server initialization failed"
+
+        send({"method": "initialized"})
+        send({"id": 2, "method": "account/rateLimits/read", "params": None})
+        response = receive(2, deadline)
+        if not response:
+            return None, f"Codex reset-credit read timed out after {timeout_s}s"
+        if response.get("error"):
+            return None, safe_tail(json.dumps(response["error"], ensure_ascii=False), 800)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return None, "Codex reset-credit read returned no result"
+        return normalize_codex_reset_credits(result.get("rateLimitResetCredits"), fetched_at=utc_now_iso()), None
+    except Exception as exc:
+        return None, safe_tail(str(exc), 800)
+    finally:
+        selector.close()
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+
+def short_identity_fingerprint(identity_key: str) -> str:
+    key = str(identity_key or "")
+    if not key:
+        return "unknown"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+
+
+def parse_iso_datetime_lenient(value: Any) -> datetime | None:
+    parsed = parse_iso_datetime(value)
+    if parsed is not None:
+        return parsed
+
+    if not isinstance(value, str):
+        return None
+
+    # Antigravity writes RFC3339 timestamps with nanosecond precision; Python's
+    # datetime parser only needs microseconds.
+    match = re.match(r"^(.+?\.)(\d{6})\d+([+-]\d\d:\d\d|Z)$", value.strip())
+    if not match:
+        return None
+    return parse_iso_datetime("".join(match.groups()))
+
+
+def resolve_antigravity_bin() -> str:
+    env_bin = os.environ.get("ANTIGRAVITY_BIN")
+    if env_bin:
+        return env_bin
+
+    which_bin = shutil.which("agy")
+    if which_bin:
+        return which_bin
+
+    for candidate in (Path("/usr/local/bin/agy"), Path.home() / ".local" / "bin" / "agy"):
+        if candidate.is_file():
+            return str(candidate)
+
+    return "agy"
+
+
+def load_antigravity_token_payload(token_path: Path) -> dict[str, Any]:
+    payload = load_json(token_path)
+    if not isinstance(payload, dict):
+        return {}
+    token = payload.get("token")
+    if not isinstance(token, dict):
+        return {}
+    return {
+        "accessToken": token.get("access_token") if isinstance(token.get("access_token"), str) else None,
+        "refreshTokenPresent": bool(token.get("refresh_token")),
+        "tokenType": token.get("token_type") if isinstance(token.get("token_type"), str) else None,
+        "expiry": token.get("expiry") if isinstance(token.get("expiry"), str) else None,
+        "authMethod": payload.get("auth_method") if isinstance(payload.get("auth_method"), str) else None,
+    }
+
+
+def antigravity_token_meta(token_payload: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    expiry_dt = parse_iso_datetime_lenient(token_payload.get("expiry"))
+    if expiry_dt is not None:
+        expires_at = expiry_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        expires_in = int(round((expiry_dt - now).total_seconds()))
+        meta["accessTokenExpiresAt"] = expires_at
+        meta["expiresInSeconds"] = expires_in
+        meta["expired"] = expires_in <= 0
+    if token_payload.get("authMethod"):
+        meta["authMethod"] = token_payload["authMethod"]
+    return meta
+
+
+def refresh_antigravity_token_if_needed(
+    token_path: Path,
+    *,
+    now: datetime,
+    base_env: dict[str, str],
+    errors: list[dict[str, Any]],
+    max_stderr_chars: int,
+    force: bool = False,
+) -> dict[str, Any]:
+    token_payload = load_antigravity_token_payload(token_path)
+    expiry_dt = parse_iso_datetime_lenient(token_payload.get("expiry"))
+    try:
+        skew_s = int(os.environ.get("ANTIGRAVITY_REFRESH_SKEW_SECONDS", "300"))
+    except Exception:
+        skew_s = 300
+    if skew_s < 0:
+        skew_s = 0
+
+    should_refresh = force
+    if not should_refresh and expiry_dt is not None:
+        should_refresh = (expiry_dt - now).total_seconds() <= float(skew_s)
+
+    if not should_refresh:
+        return token_payload
+
+    agy_bin = resolve_antigravity_bin()
+    try:
+        timeout_s = int(os.environ.get("ANTIGRAVITY_REFRESH_TIMEOUT_S", "45"))
+    except Exception:
+        timeout_s = 45
+    if timeout_s <= 0:
+        timeout_s = 45
+
+    res = run_cmd([agy_bin, "models"], timeout_s=timeout_s, env=base_env)
+    if res.exit_code != 0:
+        errors.append(
+            {
+                "command": "agy models",
+                "exitCode": res.exit_code,
+                "message": safe_tail(res.stderr or res.stdout, max_stderr_chars) or f"Exit {res.exit_code}",
+            }
+        )
+
+    refreshed = load_antigravity_token_payload(token_path)
+    return refreshed or token_payload
+
+
+def antigravity_api_bases() -> list[str]:
+    raw = os.environ.get("ANTIGRAVITY_API_BASE_URLS", "")
+    if raw.strip():
+        bases = [part.strip().rstrip("/") for part in re.split(r"[,\s]+", raw) if part.strip()]
+        if bases:
+            return bases
+    return [
+        "https://daily-cloudcode-pa.googleapis.com",
+        "https://cloudcode-pa.googleapis.com",
+    ]
+
+
+def post_antigravity_json(base_url: str, path: str, access_token: str, payload: dict[str, Any], *, timeout_s: int) -> tuple[int, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}{path}",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity",
+            "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return int(getattr(resp, "status", 200) or 200), json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            payload = {"error": {"message": raw.strip() or f"HTTP {e.code}"}}
+        return int(e.code), payload
+
+
+def antigravity_error_message(status: int, payload: Any) -> str:
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "").strip()
+            if msg:
+                return msg
+        msg = str(payload.get("message") or "").strip()
+        if msg:
+            return msg
+    return f"HTTP {status}"
+
+
+def parse_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        n = float(value)
+    except Exception:
+        return None
+    return n if n == n and n not in (float("inf"), float("-inf")) else None
+
+
+def clamp_percent(value: float) -> float:
+    if value < 0:
+        return 0.0
+    if value > 100:
+        return 100.0
+    return value
+
+
+def antigravity_model_label(model_id: str) -> str:
+    normalized = str(model_id or "").strip().lower()
+    normalized = re.sub(r"-(\d)-(\d)(?=-|$)", r"-\1.\2", normalized)
+    normalized = normalized.replace("gpt-oss", "gptoss")
+    parts = [part for part in re.split(r"[-_\s]+", normalized) if part]
+    if not parts:
+        return "Model"
+
+    out: list[str] = []
+    for part in parts:
+        lower = part.lower()
+        if lower == "gptoss":
+            out.append("GPT-OSS")
+        elif lower == "gpt":
+            out.append("GPT")
+        elif lower == "oss":
+            out.append("OSS")
+        elif re.fullmatch(r"\d+b", lower):
+            out.append(lower.upper())
+        elif lower in {"ai", "api"}:
+            out.append(lower.upper())
+        else:
+            out.append(lower[:1].upper() + lower[1:])
+    return " ".join(out)
+
+
+def normalized_antigravity_model_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def antigravity_window_minutes_from_reset(reset_dt: datetime | None, *, now: datetime) -> int:
+    if reset_dt is None:
+        return 300
+    seconds = max(0.0, (reset_dt - now).total_seconds())
+    minutes = seconds / 60.0
+    if minutes <= 6 * 60:
+        return 300
+    if minutes <= 36 * 60:
+        return 1440
+    if minutes <= 9 * 24 * 60:
+        return 10080
+    return 43200
+
+
+def antigravity_window_label(minutes: int) -> str:
+    if minutes == 300:
+        return "Session (5h)"
+    if minutes == 10080:
+        return "Week (7d)"
+    if minutes == 1440:
+        return "Window (24h)"
+    if minutes == 43200:
+        return "Month"
+    return f"Window ({minutes}m)"
+
+
+def antigravity_selected_model() -> str:
+    return os.environ.get("ANTIGRAVITY_MODEL", "Claude Opus 4.6 (Thinking)").strip() or "Claude Opus 4.6 (Thinking)"
+
+
+def compact_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
+def extract_antigravity_plan(load_data: Any) -> str:
+    if not isinstance(load_data, dict):
+        return "Antigravity"
+    current_tier = load_data.get("currentTier")
+    if isinstance(current_tier, dict):
+        name = str(current_tier.get("name") or "").strip()
+        if name:
+            return name
+    plan_type = str(load_data.get("planType") or "").strip()
+    if plan_type:
+        return plan_type
+    return "Antigravity"
+
+
+def extract_antigravity_project_id(load_data: Any) -> str | None:
+    if not isinstance(load_data, dict):
+        return None
+    project = load_data.get("cloudaicompanionProject")
+    if isinstance(project, str) and project.strip():
+        return project.strip()
+    if isinstance(project, dict):
+        project_id = str(project.get("id") or "").strip()
+        if project_id:
+            return project_id
+    return None
+
+
+def antigravity_model_windows(models_data: Any, *, now: datetime) -> list[dict[str, Any]]:
+    if not isinstance(models_data, dict):
+        return []
+    models = models_data.get("models")
+    if not isinstance(models, dict):
+        return []
+
+    windows: list[dict[str, Any]] = []
+    selected_model_key = normalized_antigravity_model_name(antigravity_selected_model())
+    for order, (model_id, model_info) in enumerate(models.items()):
+        model_key = str(model_id or "").strip()
+        lower = model_key.lower()
+        if not model_key or "chat_" in lower or "tab_" in lower:
+            continue
+        if not isinstance(model_info, dict):
+            continue
+        quota = model_info.get("quotaInfo") or model_info.get("quota_info")
+        if not isinstance(quota, dict):
+            continue
+        remaining = parse_float(quota.get("remainingFraction") if "remainingFraction" in quota else quota.get("remaining_fraction"))
+        reset_dt = parse_iso_datetime(quota.get("resetTime") or quota.get("reset_time"))
+        inferred_exhausted = False
+        if remaining is None and reset_dt is not None:
+            # Antigravity currently omits remainingFraction for some exhausted
+            # premium model rows, but still returns the reset time.
+            remaining = 0.0
+            inferred_exhausted = True
+        if remaining is None:
+            continue
+        used_percent = clamp_percent((1.0 - remaining) * 100.0)
+        label = str(model_info.get("displayName") or "").strip() or antigravity_model_label(model_key)
+        normalized_label = normalized_antigravity_model_name(label)
+        is_selected = bool(selected_model_key and (selected_model_key == normalized_label or selected_model_key == normalized_antigravity_model_name(model_key)))
+        is_recommended = model_info.get("recommended") is True
+        window: dict[str, Any] = {
+            "label": label,
+            "modelId": model_key,
+            "usedPercent": round(used_percent, 1),
+            "remainingFraction": remaining,
+            "windowMinutes": antigravity_window_minutes_from_reset(reset_dt, now=now),
+            "inferredExhausted": inferred_exhausted,
+            "_order": order,
+            "_selected": is_selected,
+            "_recommended": is_recommended,
+        }
+        if reset_dt is not None:
+            window["resetsAt"] = reset_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            window["resetDescription"] = f"resets in {compact_duration((reset_dt - now).total_seconds())}"
+            window["_resetEpoch"] = reset_dt.timestamp()
+        windows.append(window)
+
+    windows.sort(
+        key=lambda w: (
+            0 if w.get("_selected") else 1,
+            -float(w.get("usedPercent") or 0),
+            0 if w.get("_recommended") else 1,
+            float(w.get("_resetEpoch") or 10**18),
+            int(w.get("_order") or 0),
+        )
+    )
+    for window in windows:
+        window.pop("_order", None)
+        window.pop("_selected", None)
+        window.pop("_recommended", None)
+        window.pop("_resetEpoch", None)
+    return windows[:10]
+
+
+def antigravity_summary_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_minutes: dict[int, list[dict[str, Any]]] = {}
+    for window in windows:
+        try:
+            minutes = int(window.get("windowMinutes"))
+        except Exception:
+            continue
+        if minutes <= 0:
+            continue
+        by_minutes.setdefault(minutes, []).append(window)
+
+    priority = {300: 0, 10080: 1, 1440: 2, 43200: 3}
+    summaries: list[dict[str, Any]] = []
+    for minutes, group in sorted(by_minutes.items(), key=lambda item: (priority.get(item[0], 99), item[0])):
+        best = max(group, key=lambda w: float(w.get("usedPercent") or 0))
+        reset_candidates = [parse_iso_datetime(w.get("resetsAt")) for w in group]
+        reset_candidates = [dt for dt in reset_candidates if dt is not None]
+        reset_dt = min(reset_candidates) if reset_candidates else None
+        summary: dict[str, Any] = {
+            "label": antigravity_window_label(minutes),
+            "usedPercent": round(float(best.get("usedPercent") or 0), 1),
+            "windowMinutes": minutes,
+            "sourceModel": best.get("label"),
+        }
+        if reset_dt is not None:
+            summary["resetsAt"] = reset_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            summary["resetDescription"] = f"resets in {compact_duration((reset_dt - datetime.now(timezone.utc)).total_seconds())}"
+        summaries.append(summary)
+    return summaries[:3]
+
+
+def antigravity_window_minutes_from_name(value: Any) -> int | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"5h", "five_hour", "five-hour", "five hour"}:
+        return 300
+    if normalized in {"weekly", "week", "7d", "seven_day", "seven-day", "seven day"}:
+        return 10080
+    if normalized in {"daily", "day", "24h"}:
+        return 1440
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)h", normalized)
+    if match:
+        return int(round(float(match.group(1)) * 60))
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)d", normalized)
+    if match:
+        return int(round(float(match.group(1)) * 1440))
+    return None
+
+
+def antigravity_quota_group_score(group: dict[str, Any], selected_model: str) -> int:
+    text = normalized_antigravity_model_name(
+        " ".join(
+            str(part or "")
+            for part in (
+                group.get("displayName"),
+                group.get("description"),
+            )
+        )
+    )
+    selected = normalized_antigravity_model_name(selected_model)
+    if any(part in selected.split() for part in ("claude", "gpt", "oss", "openai", "anthropic")):
+        if any(part in text.split() for part in ("claude", "gpt", "oss", "anthropic")):
+            return 0
+        if "gemini" in text.split():
+            return 10
+    if "gemini" in selected.split():
+        if "gemini" in text.split():
+            return 0
+        if any(part in text.split() for part in ("claude", "gpt", "oss", "anthropic")):
+            return 10
+    return 5
+
+
+def antigravity_quota_summary_windows(summary_data: Any, *, now: datetime) -> list[dict[str, Any]]:
+    if not isinstance(summary_data, dict):
+        return []
+    groups = summary_data.get("groups")
+    if not isinstance(groups, list):
+        return []
+
+    valid_groups = [group for group in groups if isinstance(group, dict)]
+    if not valid_groups:
+        return []
+
+    selected_model = antigravity_selected_model()
+    group = sorted(
+        valid_groups,
+        key=lambda item: (
+            antigravity_quota_group_score(item, selected_model),
+            str(item.get("displayName") or ""),
+        ),
+    )[0]
+    group_name = str(group.get("displayName") or "").strip() or None
+    buckets = group.get("buckets")
+    if not isinstance(buckets, list):
+        return []
+
+    windows: list[dict[str, Any]] = []
+    priority = {300: 0, 10080: 1, 1440: 2, 43200: 3}
+    for order, bucket in enumerate(buckets):
+        if not isinstance(bucket, dict):
+            continue
+        remaining = parse_float(bucket.get("remainingFraction") if "remainingFraction" in bucket else bucket.get("remaining_fraction"))
+        if remaining is None:
+            continue
+        minutes = antigravity_window_minutes_from_name(bucket.get("window"))
+        if minutes is None:
+            reset_dt_for_minutes = parse_iso_datetime(bucket.get("resetTime") or bucket.get("reset_time"))
+            minutes = antigravity_window_minutes_from_reset(reset_dt_for_minutes, now=now)
+        reset_dt = parse_iso_datetime(bucket.get("resetTime") or bucket.get("reset_time"))
+        description = str(bucket.get("description") or "").strip()
+        window: dict[str, Any] = {
+            "label": antigravity_window_label(minutes),
+            "usedPercent": round(clamp_percent((1.0 - remaining) * 100.0), 1),
+            "remainingFraction": remaining,
+            "windowMinutes": minutes,
+            "sourceGroup": group_name,
+            "bucketId": bucket.get("bucketId"),
+            "bucketName": bucket.get("displayName"),
+            "_order": order,
+        }
+        if reset_dt is not None:
+            window["resetsAt"] = reset_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            window["resetDescription"] = description or f"resets in {compact_duration((reset_dt - now).total_seconds())}"
+            window["_resetEpoch"] = reset_dt.timestamp()
+        elif description:
+            window["resetDescription"] = description
+        windows.append(window)
+
+    windows.sort(
+        key=lambda window: (
+            priority.get(int(window.get("windowMinutes") or 0), 99),
+            float(window.get("_resetEpoch") or 10**18),
+            int(window.get("_order") or 0),
+        )
+    )
+    for window in windows:
+        window.pop("_order", None)
+        window.pop("_resetEpoch", None)
+    return windows[:3]
+
+
+def antigravity_credits_window(load_data: Any) -> dict[str, Any] | None:
+    if not isinstance(load_data, dict):
+        return None
+    available = parse_float(load_data.get("availablePromptCredits"))
+    plan_info = load_data.get("planInfo")
+    monthly = None
+    if isinstance(plan_info, dict):
+        monthly = parse_float(plan_info.get("monthlyPromptCredits"))
+    if available is None or monthly is None or monthly <= 0:
+        return None
+    used = max(0.0, monthly - available)
+    return {
+        "label": "Credits",
+        "usedPercent": round(clamp_percent((used / monthly) * 100.0), 1),
+        "availableCredits": available,
+        "monthlyCredits": monthly,
+        "windowMinutes": 43200,
+    }
+
+
+def fetch_antigravity_api_snapshot(access_token: str, *, timeout_s: int, now: datetime) -> tuple[dict[str, Any] | None, str | None, int]:
+    last_error = "No Antigravity API endpoints configured"
+    last_status = 1
+
+    for base_url in antigravity_api_bases():
+        try:
+            status, load_data = post_antigravity_json(
+                base_url,
+                "/v1internal:loadCodeAssist",
+                access_token,
+                {
+                    "metadata": {
+                        "ideType": "ANTIGRAVITY",
+                        "platform": "PLATFORM_UNSPECIFIED",
+                        "pluginType": "GE" + "MINI",
+                    }
+                },
+                timeout_s=timeout_s,
+            )
+        except Exception as e:
+            last_error = str(e)
+            last_status = 1
+            continue
+
+        last_status = status
+        if status == 401:
+            return None, "Token expired", status
+        if status < 200 or status >= 300:
+            last_error = antigravity_error_message(status, load_data)
+            continue
+
+        project_id = extract_antigravity_project_id(load_data)
+        model_payload: dict[str, Any] = {"project": project_id} if project_id else {}
+        try:
+            model_status, models_data = post_antigravity_json(
+                base_url,
+                "/v1internal:fetchAvailableModels",
+                access_token,
+                model_payload,
+                timeout_s=timeout_s,
+            )
+        except Exception as e:
+            model_status = 1
+            models_data = {"error": {"message": str(e)}}
+
+        model_windows = antigravity_model_windows(models_data, now=now) if 200 <= model_status < 300 else []
+        quota_status = 1
+        quota_data: Any = None
+        quota_payload: dict[str, Any] = {"project": project_id} if project_id else {}
+        try:
+            quota_status, quota_data = post_antigravity_json(
+                base_url,
+                "/v1internal:retrieveUserQuotaSummary",
+                access_token,
+                quota_payload,
+                timeout_s=timeout_s,
+            )
+        except Exception as e:
+            quota_data = {"error": {"message": str(e)}}
+        if quota_status == 401:
+            return None, "Token expired", quota_status
+
+        windows = antigravity_quota_summary_windows(quota_data, now=now) if 200 <= quota_status < 300 else []
+        if not windows:
+            windows = antigravity_summary_windows(model_windows)
+        credits_window = antigravity_credits_window(load_data)
+        if credits_window:
+            windows = [*windows[:2], credits_window, *windows[2:]]
+
+        if not windows and not (200 <= model_status < 300):
+            if 200 <= quota_status < 300:
+                last_error = antigravity_error_message(model_status, models_data)
+                last_status = model_status
+            else:
+                last_error = antigravity_error_message(quota_status, quota_data)
+                last_status = quota_status
+            continue
+
+        plan = extract_antigravity_plan(load_data)
+        usage: dict[str, Any] = {
+            "updatedAt": utc_now_iso(),
+            "identity": {
+                "providerID": "antigravity",
+                "loginMethod": plan,
+            },
+            "loginMethod": plan,
+            "selectedModel": antigravity_selected_model(),
+            "primary": windows[0] if len(windows) > 0 else None,
+            "secondary": windows[1] if len(windows) > 1 else None,
+            "tertiary": windows[2] if len(windows) > 2 else None,
+            "modelWindows": model_windows,
+        }
+        return {
+            "provider": "antigravity",
+            "source": "api",
+            "usage": usage,
+        }, None, 0
+
+    return None, last_error, last_status
+
+
+def collect_antigravity_usage(
+    *,
+    generated_at: str,
+    base_env: dict[str, str],
+    usage_timeout_s: int,
+    errors: list[dict[str, Any]],
+    max_stderr_chars: int,
+) -> tuple[dict[str, Any], int]:
+    token_path = Path(os.environ.get("ANTIGRAVITY_TOKEN_PATH", str(Path.home() / ".antigravity" / "antigravity-oauth-token")))
+    now = datetime.now(timezone.utc)
+    token_payload = refresh_antigravity_token_if_needed(
+        token_path,
+        now=now,
+        base_env=base_env,
+        errors=errors,
+        max_stderr_chars=max_stderr_chars,
+    )
+    access_token = token_payload.get("accessToken")
+    meta = antigravity_token_meta(token_payload, now=now)
+
+    agy_bin = resolve_antigravity_bin()
+    version = None
+    version_res = run_cmd([agy_bin, "--version"], timeout_s=10, env=base_env)
+    if version_res.exit_code == 0:
+        version = (version_res.stdout or "").strip() or None
+
+    if not isinstance(access_token, str) or not access_token.strip():
+        entry = {
+            "provider": "antigravity",
+            "source": "api",
+            "version": version,
+            "auth": meta,
+            "updatedAt": generated_at,
+            "error": {
+                "kind": "provider",
+                "code": 1,
+                "message": f"Antigravity token not found at {token_path}",
+            },
+        }
+        return entry, 1
+
+    snapshot, err, exit_code = fetch_antigravity_api_snapshot(access_token.strip(), timeout_s=usage_timeout_s, now=now)
+    if err == "Token expired":
+        token_payload = refresh_antigravity_token_if_needed(
+            token_path,
+            now=now,
+            base_env=base_env,
+            errors=errors,
+            max_stderr_chars=max_stderr_chars,
+            force=True,
+        )
+        access_token = token_payload.get("accessToken")
+        meta = antigravity_token_meta(token_payload, now=now)
+        if isinstance(access_token, str) and access_token.strip():
+            snapshot, err, exit_code = fetch_antigravity_api_snapshot(access_token.strip(), timeout_s=usage_timeout_s, now=now)
+
+    if snapshot is not None:
+        snapshot["version"] = version
+        snapshot["auth"] = meta
+        return snapshot, 0
+
+    entry = {
+        "provider": "antigravity",
+        "source": "api",
+        "version": version,
+        "auth": meta,
+        "updatedAt": generated_at,
+        "error": {
+            "kind": "provider",
+            "code": exit_code or 1,
+            "message": err or "Antigravity usage fetch failed",
+        },
+    }
+    return entry, exit_code or 1
+
+
 def read_tail_lines(path: Path, *, max_bytes: int) -> list[str]:
     try:
         with path.open("rb") as f:
@@ -347,6 +1445,109 @@ def read_tail_lines(path: Path, *, max_bytes: int) -> list[str]:
 
     text = chunk.decode("utf-8", errors="replace")
     return [line for line in text.splitlines() if line.strip()]
+
+
+def collect_grok_usage(*, generated_at: str, base_env: dict[str, str]) -> tuple[dict[str, Any], int]:
+    """Read the most recent Grok CLI billing snapshot without spending tokens."""
+    grok_home = Path(os.environ.get("GROK_HOME", str(Path.home() / ".grok")))
+    log_path = Path(os.environ.get("GROK_LOG_PATH", str(grok_home / "logs" / "unified.jsonl")))
+    try:
+        max_bytes = max(65536, int(os.environ.get("GROK_USAGE_LOG_MAX_BYTES", "4194304")))
+    except Exception:
+        max_bytes = 4194304
+
+    latest_event: dict[str, Any] | None = None
+    for line in reversed(read_tail_lines(log_path, max_bytes=max_bytes)):
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict) or event.get("msg") != "billing: fetched credits config":
+            continue
+        ctx = event.get("ctx")
+        config = ctx.get("config") if isinstance(ctx, dict) else None
+        if isinstance(config, dict):
+            latest_event = event
+            break
+
+    grok_bin = os.environ.get("GROK_BIN") or shutil.which("grok", path=base_env.get("PATH")) or str(Path.home() / ".local" / "bin" / "grok")
+    version = None
+    version_res = run_cmd([grok_bin, "--version"], timeout_s=10, env=base_env)
+    if version_res.exit_code == 0:
+        version = (version_res.stdout or "").strip() or None
+
+    if latest_event is None:
+        return {
+            "provider": "grok",
+            "displayName": "Grok CLI",
+            "source": "grok-cli-billing-log",
+            "version": version,
+            "updatedAt": generated_at,
+            "error": {
+                "kind": "provider",
+                "code": 1,
+                "message": f"No Grok CLI billing snapshot found in {log_path}",
+            },
+        }, 1
+
+    ctx = latest_event.get("ctx") or {}
+    config = ctx.get("config") or {}
+    period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
+    start_dt = parse_iso_datetime(period.get("start") or config.get("billingPeriodStart"))
+    end_dt = parse_iso_datetime(period.get("end") or config.get("billingPeriodEnd"))
+    period_type = str(period.get("type") or "").upper()
+    if "WEEK" in period_type:
+        window_minutes = 10080
+        label = "Weekly limit"
+    elif "MONTH" in period_type:
+        window_minutes = 43200
+        label = "Monthly limit"
+    elif start_dt is not None and end_dt is not None:
+        window_minutes = max(1, int(round((end_dt - start_dt).total_seconds() / 60.0)))
+        label = "Usage limit"
+    else:
+        window_minutes = 10080
+        label = "Usage limit"
+
+    try:
+        used_percent = clamp_percent(float(config.get("creditUsagePercent")))
+    except Exception:
+        used_percent = 0.0
+
+    updated_at = str(latest_event.get("ts") or generated_at)
+    tier = str(ctx.get("subscriptionTier") or "Grok").strip() or "Grok"
+    primary: dict[str, Any] = {
+        "label": label,
+        "usedPercent": round(used_percent, 1),
+        "windowMinutes": window_minutes,
+    }
+    if end_dt is not None:
+        primary["resetsAt"] = end_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        primary["resetDescription"] = f"resets in {compact_duration((end_dt - datetime.now(timezone.utc)).total_seconds())}"
+
+    usage: dict[str, Any] = {
+        "updatedAt": updated_at,
+        "identity": {"providerID": "grok", "loginMethod": tier},
+        "loginMethod": tier,
+        "primary": primary,
+        "secondary": None,
+        "tertiary": None,
+    }
+
+    for field, label_text in (("onDemandCap", "On-demand cap"), ("prepaidBalance", "Prepaid balance")):
+        raw = config.get(field)
+        value = raw.get("val") if isinstance(raw, dict) else None
+        if value is not None:
+            usage[field] = {"label": label_text, "value": value}
+
+    return {
+        "provider": "grok",
+        "displayName": "Grok CLI",
+        "source": "grok-cli-billing-log",
+        "version": version,
+        "updatedAt": updated_at,
+        "usage": usage,
+    }, 0
 
 
 def is_claude_model(value: Any) -> bool:
@@ -515,6 +1716,328 @@ def compute_last_claude_activity(*, max_files: int, max_bytes: int) -> dict[str,
     }
 
 
+def as_int(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return 0
+        return int(value)
+    except Exception:
+        return 0
+
+
+def extract_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+            elif isinstance(item, dict):
+                text = str(item.get("text") or item.get("message") or "").strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, dict):
+        text = str(value.get("text") or value.get("message") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def clip_text(value: str, max_len: int = 160) -> str:
+    collapsed = " ".join((value or "").split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 1] + "…"
+
+
+def load_claude_account_metadata() -> dict[str, Any]:
+    account_email = None
+    billing_type = None
+    auth_type = None
+
+    config_paths = [
+        Path("/root/.claude/.config.json"),
+        Path("/root/.claude.json"),
+        Path("/home/web/.claude/.config.json"),
+        Path("/home/web/.claude.json"),
+    ]
+    credential_paths = [
+        Path("/root/.claude/.credentials.json"),
+        Path("/home/web/.claude/.credentials.json"),
+    ]
+
+    for path in config_paths:
+        raw = load_json(path)
+        if not isinstance(raw, dict):
+            continue
+        oauth_account = raw.get("oauthAccount")
+        if isinstance(oauth_account, dict):
+            if account_email is None:
+                value = str(oauth_account.get("emailAddress") or "").strip()
+                if value:
+                    account_email = value
+            if billing_type is None:
+                value = str(oauth_account.get("billingType") or "").strip()
+                if value:
+                    billing_type = value
+            auth_type = auth_type or "oauth"
+
+    for path in credential_paths:
+        raw = load_json(path)
+        if not isinstance(raw, dict):
+            continue
+        oauth = raw.get("claudeAiOauth")
+        if isinstance(oauth, dict) and oauth:
+            auth_type = auth_type or "oauth"
+
+    if auth_type is None:
+        auth_type = "unknown"
+
+    return {
+        "activeAccount": account_email,
+        "billingType": billing_type,
+        "authType": auth_type,
+    }
+
+
+def collect_shared_claude_responses() -> list[dict[str, Any]]:
+    project_files: list[Path] = []
+    exclude_project_dirs = {Path("/root/.claude/projects/-home-mlweb-stats-lucheestiy-com")}
+
+    try:
+        max_files = int(os.environ.get("CLAUDE_SHARED_STATS_MAX_FILES", "800"))
+    except Exception:
+        max_files = 800
+    if max_files <= 0:
+        max_files = 800
+
+    for home in (Path("/root"), Path("/home/web")):
+        projects_dir = home / ".claude" / "projects"
+        if not projects_dir.is_dir():
+            continue
+        project_files.extend(path for path in projects_dir.glob("*/*.jsonl") if path.is_file())
+
+    project_files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    if max_files > 0:
+        project_files = project_files[:max_files]
+
+    responses_by_id: dict[str, dict[str, Any]] = {}
+
+    def should_replace_response(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
+        existing_tokens = as_int(existing.get("totalTokens")) or 0
+        candidate_tokens = as_int(candidate.get("totalTokens")) or 0
+        if candidate_tokens != existing_tokens:
+            return candidate_tokens > existing_tokens
+
+        existing_created_at = str(existing.get("createdAt") or "")
+        candidate_created_at = str(candidate.get("createdAt") or "")
+        if candidate_created_at != existing_created_at:
+            return candidate_created_at > existing_created_at
+
+        existing_meta = int(bool(existing.get("model"))) + int(bool(existing.get("version")))
+        candidate_meta = int(bool(candidate.get("model"))) + int(bool(candidate.get("version")))
+        return candidate_meta > existing_meta
+
+    for project_path in project_files:
+        if any(excl in project_path.parents for excl in exclude_project_dirs):
+            continue
+
+        session_id = project_path.stem
+        last_user = ""
+
+        try:
+            f = project_path.open("r", encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        with f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+
+                msg = event.get("message")
+                if not isinstance(msg, dict):
+                    continue
+
+                role = str(msg.get("role") or "")
+                if role == "user":
+                    if bool(event.get("isMeta")):
+                        continue
+                    user_text = extract_text(msg.get("content"))
+                    if user_text:
+                        user_text = user_text.strip()
+                        if not (
+                            user_text.startswith("<local-command")
+                            or user_text.startswith("<command-name>")
+                            or user_text.startswith("<command-message>")
+                            or user_text.startswith("<command-args>")
+                        ):
+                            last_user = user_text
+                    continue
+
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+
+                if role and role != "assistant":
+                    continue
+
+                event_type = str(event.get("type") or "")
+                if event_type and event_type != "assistant":
+                    continue
+
+                model = str(msg.get("model") or "").strip()
+                if not is_claude_model(model):
+                    continue
+
+                ts_dt = parse_iso_datetime(event.get("timestamp")) or parse_iso_datetime(msg.get("timestamp"))
+                if ts_dt is None:
+                    continue
+                created_at = ts_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                version = str(event.get("version") or "").strip()
+                input_tokens = as_int(usage.get("input_tokens"))
+                output_tokens = as_int(usage.get("output_tokens"))
+                cache_read_tokens = as_int(usage.get("cache_read_input_tokens"))
+                cache_create_tokens = as_int(usage.get("cache_creation_input_tokens"))
+                total_tokens = as_int(usage.get("total_tokens"))
+                if total_tokens <= 0:
+                    total_tokens = input_tokens + output_tokens + cache_read_tokens + cache_create_tokens
+                if total_tokens <= 0:
+                    total_tokens = 1
+
+                response_id = str(msg.get("id") or event.get("requestId") or f"{session_id}:{created_at}")
+                candidate = {
+                    "createdAt": created_at,
+                    "sessionId": session_id,
+                    "command": clip_text(last_user or "(assistant reply)"),
+                    "model": model,
+                    "version": version or None,
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "cacheReadTokens": cache_read_tokens,
+                    "cacheCreationTokens": cache_create_tokens,
+                    "totalTokens": total_tokens,
+                }
+
+                existing = responses_by_id.get(response_id)
+                if existing is None or should_replace_response(existing, candidate):
+                    responses_by_id[response_id] = candidate
+
+    responses = list(responses_by_id.values())
+    responses.sort(key=lambda x: x.get("createdAt") or "", reverse=True)
+    return responses
+
+
+def build_shared_claude_history_entries(
+    responses: list[dict[str, Any]],
+    *,
+    now: datetime,
+    max_days: int = 30,
+) -> list[dict[str, Any]]:
+    cutoff = now - timedelta(days=max_days)
+    entries: list[dict[str, Any]] = []
+
+    for item in responses:
+        if not isinstance(item, dict):
+            continue
+        dt = parse_iso_datetime(item.get("createdAt"))
+        if dt is None or dt < cutoff:
+            continue
+
+        total_tokens = as_int(item.get("totalTokens"))
+        if total_tokens <= 0:
+            total_tokens = 1
+
+        dt_local = dt.astimezone()
+        entries.append(
+            {
+                "id": f"claude:{item.get('sessionId') or ''}:{item.get('createdAt') or ''}",
+                "ts": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "hour": dt_local.hour,
+                "day": dt_local.strftime("%Y-%m-%d"),
+                "provider": "claude",
+                "account": "",
+                "activity": float(total_tokens),
+                "sessionPct": round(min(100.0, float(total_tokens) / 100.0), 3),
+                "totalTokens": total_tokens,
+                "sessionId": item.get("sessionId"),
+                "model": item.get("model"),
+                "command": item.get("command"),
+                "source": "claude-transcript",
+            }
+        )
+
+    entries.sort(key=lambda x: str(x.get("ts") or ""))
+    return entries
+
+
+def collect_shared_claude_stats(
+    now: datetime,
+    *,
+    responses: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = metadata or load_claude_account_metadata()
+    responses = responses if isinstance(responses, list) else collect_shared_claude_responses()
+    if not responses:
+        return {
+            "status": "disabled",
+            "lastUpdated": utc_now_iso(),
+            "version": None,
+            "totalResponses": 0,
+            "responses24h": 0,
+            "responses7d": 0,
+            "tokens24h": 0,
+            "tokens7d": 0,
+            "activeAccount": metadata.get("activeAccount"),
+            "authType": metadata.get("authType"),
+            "billingType": metadata.get("billingType"),
+            "recentResponses": [],
+        }
+
+    responses.sort(key=lambda x: x.get("createdAt") or "", reverse=True)
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+
+    responses24 = [r for r in responses if (parse_iso_datetime(r.get("createdAt")) or now) >= day_ago]
+    responses7 = [r for r in responses if (parse_iso_datetime(r.get("createdAt")) or now) >= week_ago]
+
+    latest_version = None
+    for item in responses:
+        value = str(item.get("version") or "").strip()
+        if value:
+            latest_version = value
+            break
+
+    return {
+        "status": "ready",
+        "lastUpdated": utc_now_iso(),
+        "version": latest_version,
+        "totalResponses": len(responses),
+        "responses24h": len(responses24),
+        "responses7d": len(responses7),
+        "tokens24h": sum(as_int(r.get("totalTokens")) for r in responses24),
+        "tokens7d": sum(as_int(r.get("totalTokens")) for r in responses7),
+        "activeAccount": metadata.get("activeAccount"),
+        "authType": metadata.get("authType"),
+        "billingType": metadata.get("billingType"),
+        "recentResponses": responses[:30],
+    }
+
+
 def to_ymd_in_tz(dt_utc: datetime, tz_name: str) -> str:
     try:
         tz = ZoneInfo(tz_name)
@@ -535,6 +2058,99 @@ def as_finite_number(value: Any) -> float | None:
         n = float(value)
         return n if n >= 0 and n != float("inf") and n == n else None
     return None
+
+
+def apply_codex_usage_monotonic_guard(
+    usage_items: list[dict[str, Any]],
+    state: Any,
+    *,
+    identity_fingerprints: dict[str, str],
+    generated_at: str,
+    errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Reject impossible usage regressions inside an unexpired Codex window.
+
+    The Codex usage endpoint can briefly return an older percentage for the
+    same account and reset timestamp. A fixed rate-limit window is monotonic:
+    usage may fall only after the window expires or the reset timestamp
+    changes. Keep the last observed high-water mark only while all of those
+    identifiers still match.
+    """
+    previous_accounts = state.get("accounts") if isinstance(state, dict) else None
+    if not isinstance(previous_accounts, dict):
+        previous_accounts = {}
+
+    next_accounts = dict(previous_accounts)
+    generated_dt = parse_iso_datetime(generated_at)
+
+    for item in usage_items:
+        if not isinstance(item, dict) or item.get("provider") != "codex":
+            continue
+
+        profile = str(item.get("codexAuthAccount") or "").strip()
+        fingerprint = identity_fingerprints.get(profile)
+        usage = item.get("usage")
+        window = usage.get("secondary") if isinstance(usage, dict) else None
+        if not profile or not fingerprint or not isinstance(window, dict):
+            continue
+
+        sampled_used = as_finite_number(window.get("usedPercent"))
+        resets_at = str(window.get("resetsAt") or "").strip()
+        window_minutes = as_finite_number(window.get("windowMinutes"))
+        reset_dt = parse_iso_datetime(resets_at)
+        if sampled_used is None or not resets_at or window_minutes is None:
+            continue
+
+        previous = previous_accounts.get(profile)
+        previous_used = as_finite_number(previous.get("usedPercent")) if isinstance(previous, dict) else None
+        same_live_window = (
+            isinstance(previous, dict)
+            and previous.get("identityFingerprint") == fingerprint
+            and previous.get("resetsAt") == resets_at
+            and as_finite_number(previous.get("windowMinutes")) == window_minutes
+            and previous_used is not None
+            and generated_dt is not None
+            and reset_dt is not None
+            and reset_dt > generated_dt
+        )
+
+        published_used = sampled_used
+        regression = same_live_window and sampled_used < previous_used
+        if regression:
+            published_used = previous_used
+            window["usedPercent"] = int(previous_used) if previous_used.is_integer() else previous_used
+            errors.append(
+                {
+                    "command": "codex usage monotonic guard",
+                    "profile": profile,
+                    "exitCode": 0,
+                    "severity": "warning",
+                    "message": (
+                        f"Ignored stale Codex usage regression for '{profile}' in the same "
+                        f"window ({sampled_used:g}% sampled after {previous_used:g}%)."
+                    ),
+                }
+            )
+
+        account_state = {
+            "identityFingerprint": fingerprint,
+            "resetsAt": resets_at,
+            "windowMinutes": int(window_minutes) if window_minutes.is_integer() else window_minutes,
+            "usedPercent": int(published_used) if published_used.is_integer() else published_used,
+            "lastSampledUsedPercent": int(sampled_used) if sampled_used.is_integer() else sampled_used,
+            "observedAt": generated_at,
+        }
+        if regression:
+            account_state["lastRegressionAt"] = generated_at
+        elif isinstance(previous, dict) and previous.get("lastRegressionAt"):
+            account_state["lastRegressionAt"] = previous.get("lastRegressionAt")
+        next_accounts[profile] = account_state
+
+    return {
+        "version": 1,
+        "updatedAt": generated_at,
+        "accounts": next_accounts,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -571,6 +2187,186 @@ def compute_minimax_cost_usd(
         + (cache_read_tokens or 0.0) * pricing["cacheRead"]
         + (cache_write_tokens or 0.0) * pricing["cacheWrite"]
     ) / 1_000_000.0
+
+
+def get_daily_models(day_entry: dict[str, Any]) -> list[str]:
+    models: list[str] = []
+    models_used = day_entry.get("modelsUsed")
+    if isinstance(models_used, list):
+        for value in models_used:
+            if isinstance(value, str) and value:
+                models.append(value)
+
+    model_breakdowns = day_entry.get("modelBreakdowns")
+    if isinstance(model_breakdowns, list):
+        for mb in model_breakdowns:
+            if not isinstance(mb, dict):
+                continue
+            name = mb.get("modelName")
+            if isinstance(name, str) and name:
+                models.append(name)
+
+    # Keep order stable while removing duplicates.
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in models:
+        if m in seen:
+            continue
+        seen.add(m)
+        out.append(m)
+    return out
+
+
+def estimate_codex_token_cost_rates(
+    daily_entries: list[Any], *, model_name: str
+) -> tuple[float | None, float | None, float | None]:
+    """
+    Estimate USD/token rates for one priced model from codexbar daily aggregates.
+    Returns (input_rate, output_rate, blended_rate).
+    """
+    samples: list[tuple[float, float, float]] = []
+    total_cost_sum = 0.0
+    total_tokens_sum = 0.0
+
+    for entry in daily_entries:
+        if not isinstance(entry, dict):
+            continue
+        total_cost = as_finite_number(entry.get("totalCost"))
+        if total_cost is None:
+            continue
+
+        models = get_daily_models(entry)
+        if not models:
+            continue
+        if any(m != model_name for m in models):
+            continue
+
+        input_tokens = as_finite_number(entry.get("inputTokens")) or 0.0
+        output_tokens = as_finite_number(entry.get("outputTokens")) or 0.0
+        total_tokens = input_tokens + output_tokens
+        if total_tokens <= 0:
+            continue
+
+        samples.append((input_tokens, output_tokens, total_cost))
+        total_cost_sum += total_cost
+        total_tokens_sum += total_tokens
+
+    if total_tokens_sum <= 0:
+        return None, None, None
+
+    blended_rate = total_cost_sum / total_tokens_sum
+
+    # Fit cost ~= input * a + output * b via least squares.
+    if len(samples) >= 2:
+        s_ii = 0.0
+        s_io = 0.0
+        s_oo = 0.0
+        s_ic = 0.0
+        s_oc = 0.0
+        for i_tokens, o_tokens, cost in samples:
+            s_ii += i_tokens * i_tokens
+            s_io += i_tokens * o_tokens
+            s_oo += o_tokens * o_tokens
+            s_ic += i_tokens * cost
+            s_oc += o_tokens * cost
+
+        det = (s_ii * s_oo) - (s_io * s_io)
+        if abs(det) > 1e-12:
+            input_rate = ((s_ic * s_oo) - (s_oc * s_io)) / det
+            output_rate = ((s_ii * s_oc) - (s_io * s_ic)) / det
+            if (
+                input_rate == input_rate
+                and output_rate == output_rate
+                and input_rate >= 0
+                and output_rate >= 0
+                and input_rate != float("inf")
+                and output_rate != float("inf")
+            ):
+                return input_rate, output_rate, blended_rate
+
+    return None, None, blended_rate
+
+
+def apply_codex_model_alias_pricing(
+    cost_items: list[Any], *, alias_model: str, priced_model: str
+) -> None:
+    """
+    Temporary fallback for models that codexbar reports without priced cost.
+    If alias_model should be priced like priced_model, backfill missing daily
+    totalCost from token usage for codex provider.
+    """
+    for item in cost_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("provider") != "codex":
+            continue
+
+        daily = item.get("daily")
+        if not isinstance(daily, list) or not daily:
+            continue
+
+        input_rate, output_rate, blended_rate = estimate_codex_token_cost_rates(daily, model_name=priced_model)
+        if blended_rate is None:
+            continue
+
+        added_total_cost = 0.0
+        for entry in daily:
+            if not isinstance(entry, dict):
+                continue
+            if as_finite_number(entry.get("totalCost")) is not None:
+                continue
+
+            models = get_daily_models(entry)
+            if not models:
+                continue
+
+            mapped = {priced_model if model == alias_model else model for model in models}
+            if mapped != {priced_model}:
+                continue
+
+            input_tokens = as_finite_number(entry.get("inputTokens")) or 0.0
+            output_tokens = as_finite_number(entry.get("outputTokens")) or 0.0
+            total_tokens = as_finite_number(entry.get("totalTokens"))
+            if total_tokens is None:
+                total_tokens = input_tokens + output_tokens
+
+            if input_rate is not None and output_rate is not None:
+                estimated_cost = (input_tokens * input_rate) + (output_tokens * output_rate)
+            else:
+                estimated_cost = (total_tokens or 0.0) * blended_rate
+
+            if estimated_cost < 0:
+                continue
+
+            entry["totalCost"] = estimated_cost
+            added_total_cost += estimated_cost
+
+            # If this day has a single unpriced breakdown entry for the alias,
+            # backfill it too so model-level views remain consistent.
+            model_breakdowns = entry.get("modelBreakdowns")
+            if isinstance(model_breakdowns, list):
+                unresolved_alias: list[dict[str, Any]] = []
+                for mb in model_breakdowns:
+                    if not isinstance(mb, dict):
+                        continue
+                    name = mb.get("modelName")
+                    if name != alias_model:
+                        continue
+                    if as_finite_number(mb.get("cost")) is None:
+                        unresolved_alias.append(mb)
+                if len(unresolved_alias) == 1:
+                    unresolved_alias[0]["cost"] = estimated_cost
+
+        if added_total_cost <= 0:
+            continue
+
+        totals = item.get("totals")
+        if not isinstance(totals, dict):
+            totals = {}
+            item["totals"] = totals
+
+        totals["totalCost"] = (as_finite_number(totals.get("totalCost")) or 0.0) + added_total_cost
+        item["last30DaysCostUSD"] = (as_finite_number(item.get("last30DaysCostUSD")) or 0.0) + added_total_cost
 
 
 def compute_clawdbot_cost_delta(
@@ -1358,7 +3154,65 @@ def fill_missing_cost_days(cost_items: list[Any], *, tz_name: str, days: int) ->
         item["daily"] = merged_daily
 
 
-def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], generated_at: str, current_codex_account: str | None = None) -> None:
+def load_kimi_history_for_heatmap(data_dir: Path) -> list[dict[str, Any]]:
+    """
+    Load Kimi history from kimi-history.json and convert to heatmap format.
+    Returns list of entries with {ts, hour, day, provider, account, activity}.
+    """
+    kimi_history_path = data_dir / "kimi-history.json"
+    if not kimi_history_path.is_file():
+        return []
+    
+    try:
+        with open(kimi_history_path, "r", encoding="utf-8") as f:
+            kimi_data = json.load(f)
+    except Exception:
+        return []
+    
+    if not isinstance(kimi_data, list):
+        return []
+    
+    entries = []
+    for item in kimi_data:
+        if not isinstance(item, dict):
+            continue
+        
+        ts = item.get("ts")
+        activity = item.get("activity")
+        
+        if ts is None or activity is None:
+            continue
+        
+        # Parse timestamp to get hour and day
+        dt = parse_iso_datetime(ts)
+        if dt is None:
+            continue
+        
+        # Convert to local time for hour/day display
+        dt_local = dt.astimezone()
+        hour = dt_local.hour
+        day = dt_local.strftime("%Y-%m-%d")
+        
+        entries.append({
+            "ts": ts,
+            "hour": hour,
+            "day": day,
+            "provider": "kimi",
+            "account": item.get("account", "default"),
+            "activity": float(activity) if isinstance(activity, (int, float)) else 0.0,
+        })
+    
+    return entries
+
+
+def update_hourly_history(
+    data_dir: Path,
+    usage_items: list[dict[str, Any]],
+    generated_at: str,
+    current_codex_account: str | None = None,
+    provider_history_entries: list[dict[str, Any]] | None = None,
+    excluded_providers: set[str] | None = None,
+) -> None:
     """
     Track hourly usage history for heatmap visualization.
     Calculates delta (activity) by comparing current values to previous run.
@@ -1369,17 +3223,89 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
     state_path = data_dir / ".history_state.json"
 
     history = load_history(history_path)
-    prev_state = load_history(state_path) if state_path.is_file() else {}
-    if isinstance(prev_state, list):
+    external_entries = [entry for entry in (provider_history_entries or []) if isinstance(entry, dict)]
+    excluded_provider_ids = {
+        str(provider).strip().lower()
+        for provider in (excluded_providers or set())
+        if str(provider).strip()
+    }
+    if excluded_provider_ids:
+        history = [
+            entry
+            for entry in history
+            if str(entry.get("provider") or "").strip().lower() not in excluded_provider_ids
+        ]
+        external_entries = [
+            entry
+            for entry in external_entries
+            if str(entry.get("provider") or "").strip().lower() not in excluded_provider_ids
+        ]
+
+    external_providers = {
+        str(entry.get("provider") or "").strip().lower()
+        for entry in external_entries
+        if str(entry.get("provider") or "").strip()
+    }
+    external_sources_by_provider: dict[str, set[str]] = {}
+    for entry in external_entries:
+        provider_id = str(entry.get("provider") or "").strip().lower()
+        if not provider_id:
+            continue
+        source_id = str(entry.get("source") or "").strip().lower()
+        external_sources_by_provider.setdefault(provider_id, set()).add(source_id)
+
+    if external_providers:
+        history = [
+            entry
+            for entry in history
+            if not (
+                str(entry.get("provider") or "").strip().lower() in external_providers
+                and str(entry.get("source") or "").strip().lower()
+                in external_sources_by_provider.get(str(entry.get("provider") or "").strip().lower(), set())
+            )
+        ]
+    
+    # Merge Kimi history from kimi-history.json
+    kimi_entries = load_kimi_history_for_heatmap(data_dir)
+    if kimi_entries:
+        # Create a set of existing (day, hour, provider) combinations to avoid duplicates
+        existing_keys = {(e.get("day"), e.get("hour"), e.get("provider")) for e in history}
+        for entry in kimi_entries:
+            key = (entry.get("day"), entry.get("hour"), entry.get("provider"))
+            if key not in existing_keys:
+                history.append(entry)
+                existing_keys.add(key)
+    prev_state = load_json(state_path) if state_path.is_file() else {}
+    if not isinstance(prev_state, dict):
         prev_state = {}
+    if excluded_provider_ids and isinstance(prev_state, dict):
+        prev_state = {
+            key: value
+            for key, value in prev_state.items()
+            if str(key).split("|", 1)[0].strip().lower() not in excluded_provider_ids
+        }
 
     # Use local time for hour/day display
     now_local = datetime.now()
     now = datetime.now(timezone.utc)
+    generated_dt = parse_iso_datetime(generated_at) or now
     hour = now_local.hour
     day = now_local.strftime("%Y-%m-%d")
 
     current_state: dict[str, Any] = {}
+    latest_external_ts_by_key: dict[str, datetime] = {}
+    for entry in external_entries:
+        provider = str(entry.get("provider") or "").strip()
+        if not provider:
+            continue
+        account = str(entry.get("account") or "")
+        key = f"{provider}|{account}"
+        ts = parse_iso_datetime(entry.get("ts"))
+        if ts is None:
+            continue
+        prev_ts = latest_external_ts_by_key.get(key)
+        if prev_ts is None or ts > prev_ts:
+            latest_external_ts_by_key[key] = ts
 
     # Extract usage percentages and calculate deltas
     for item in usage_items:
@@ -1387,6 +3313,9 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
             continue
 
         provider = item.get("provider", "unknown")
+        provider_id = str(provider or "unknown").strip().lower()
+        if provider_id in excluded_provider_ids:
+            continue
         account = item.get("codexAuthAccount", "")
 
         usage = item.get("usage", {})
@@ -1395,6 +3324,14 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
 
         primary = usage.get("primary", {})
         session_pct = primary.get("usedPercent") if isinstance(primary, dict) else None
+        window_minutes = None
+        if isinstance(primary, dict):
+            try:
+                maybe_window_minutes = int(primary.get("windowMinutes"))
+            except Exception:
+                maybe_window_minutes = 0
+            if maybe_window_minutes > 0:
+                window_minutes = maybe_window_minutes
 
         if session_pct is None:
             continue
@@ -1418,9 +3355,15 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
             # First run or no previous data - if there's usage, record it
             activity = session_pct
 
-        # For codex provider, only record history for the current active account
-        if provider == "codex" and current_codex_account and account != current_codex_account:
-            continue
+        if provider_id in external_providers:
+            fallback_window_minutes = window_minutes or 300
+            latest_external_ts = latest_external_ts_by_key.get(key)
+            has_recent_external_history = (
+                latest_external_ts is not None
+                and latest_external_ts >= generated_dt - timedelta(minutes=fallback_window_minutes)
+            )
+            if has_recent_external_history:
+                continue
 
         # Only record if there was meaningful activity (> 0.1% to avoid noise)
         if activity > 0.1:
@@ -1431,8 +3374,13 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
                 "provider": provider,
                 "account": account,
                 "activity": round(activity, 1),
+                "source": "usage-snapshot",
+                "sessionPct": round(float(session_pct), 3),
             }
             history.append(entry)
+
+    if external_entries:
+        history.extend(external_entries)
 
     # Save current state for next comparison
     atomic_write_json(state_path, current_state)
@@ -1440,6 +3388,7 @@ def update_hourly_history(data_dir: Path, usage_items: list[dict[str, Any]], gen
     # Prune entries older than 30 days
     cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d")
     history = [e for e in history if e.get("day", "") >= cutoff]
+    history = prune_redundant_usage_snapshot_runs(history)
 
     atomic_write_json(history_path, history)
 
@@ -1449,6 +3398,20 @@ def parse_accounts_env(value: str) -> list[str]:
     if not value:
         return []
     return [part for part in re.split(r"[,\s]+", value) if part]
+
+
+def load_blocked_codex_accounts(state_path: Path) -> set[str]:
+    state = load_json(state_path)
+    if not isinstance(state, dict):
+        return set()
+    blocked = state.get("blockedAccounts")
+    if not isinstance(blocked, dict):
+        return set()
+    out: set[str] = set()
+    for account in blocked.keys():
+        if isinstance(account, str) and account.strip():
+            out.add(account.strip())
+    return out
 
 
 def remove_key_recursive(obj: Any, key: str) -> None:
@@ -1462,16 +3425,50 @@ def remove_key_recursive(obj: Any, key: str) -> None:
             remove_key_recursive(v, key)
 
 
+def publish_shared_claude_webhost_files(*, errors: list[dict[str, Any]], max_stderr_chars: int) -> None:
+    publish_enabled = str(os.environ.get("PUBLISH_SHARED_CLAUDE_WEBHOSTS", "1")).strip().lower()
+    if publish_enabled in ("0", "false", "off", "no", "disabled"):
+        return
+
+    publish_script = Path(os.environ.get("SHARED_CLAUDE_PUBLISH_SCRIPT", "/root/scripts/publish-shared-ai-webhosts.sh"))
+    if not publish_script.is_file():
+        return
+
+    try:
+        timeout_s = int(os.environ.get("SHARED_CLAUDE_PUBLISH_TIMEOUT_S", "90"))
+    except Exception:
+        timeout_s = 90
+
+    res = run_cmd([str(publish_script)], timeout_s=timeout_s)
+    if res.exit_code != 0:
+        errors.append(
+            {
+                "command": str(publish_script),
+                "exitCode": res.exit_code,
+                "severity": "warning",
+                "message": safe_tail(res.stderr or res.stdout, max_stderr_chars) or f"Exit {res.exit_code}",
+            }
+        )
+
+
 def main() -> int:
     os.umask(0o022)
 
     base_dir = Path(__file__).resolve().parent.parent
     data_dir = base_dir / "public" / "data"
+    claude_stats_path = data_dir / "claude-stats.json"
+    claude_usage_path = data_dir / "claude-usage.json"
 
-    base_env = ensure_path_has_dir(dict(os.environ), str(Path.home() / ".local" / "bin"))
+    home_dir = str(Path.home())
+    base_env = ensure_path_has_dir(dict(os.environ), str(Path(home_dir) / ".local" / "bin"))
+    if not base_env.get("HOME"):
+        base_env["HOME"] = home_dir
 
     codexbar_bin = os.environ.get("CODEXBAR_BIN", "/usr/local/bin/codexbar")
+    codex_bin = os.environ.get("CODEX_BIN", "/usr/bin/codex")
     usage_timeout_s = int(os.environ.get("USAGE_TIMEOUT_S", "60"))
+    codex_reset_credit_timeout_s = int(os.environ.get("CODEX_RESET_CREDIT_TIMEOUT_S", "20"))
+    codex_reset_credit_interval_s = int(os.environ.get("CODEX_RESET_CREDIT_INTERVAL_S", "3600"))
     cost_timeout_s = int(os.environ.get("COST_TIMEOUT_S", "180"))
     max_stderr_chars = int(os.environ.get("MAX_STDERR_CHARS", "4000"))
 
@@ -1513,9 +3510,37 @@ def main() -> int:
     codex_accounts_dir = Path(os.environ.get("CODEX_ACCOUNTS_DIR", str(Path.home() / ".codex" / "accounts")))
     codex_config_toml = Path(os.environ.get("CODEX_CONFIG_TOML", str(Path.home() / ".codex" / "config.toml")))
     selected_accounts = parse_accounts_env(os.environ.get("CODEX_AUTH_ACCOUNTS", ""))
+    codex_switcher_state_path = Path(
+        os.environ.get(
+            "CODEX_AUTH_SWITCHER_STATE_PATH",
+            str(Path.home() / ".codex" / "codex-auth-switcher-state.json"),
+        )
+    )
+    blocked_codex_accounts = load_blocked_codex_accounts(codex_switcher_state_path)
+    codex_reset_credit_cache_path = base_dir / "logs" / "codex-reset-credits-cache.json"
+    codex_reset_credit_cache = load_json(codex_reset_credit_cache_path)
+    if not isinstance(codex_reset_credit_cache, dict):
+        codex_reset_credit_cache = {}
+    codex_usage_window_state_path = base_dir / "logs" / "codex-usage-window-state.json"
+    codex_usage_window_state = load_json(codex_usage_window_state_path)
+    if not isinstance(codex_usage_window_state, dict):
+        codex_usage_window_state = {}
 
     generated_at = utc_now_iso()
     hostname = socket.gethostname()
+    shared_claude_now = datetime.now(timezone.utc)
+    codex_auth_meta_generated_at = shared_claude_now
+    claude_metadata = load_claude_account_metadata()
+    claude_responses = collect_shared_claude_responses()
+    claude_stats_payload = collect_shared_claude_stats(
+        shared_claude_now,
+        responses=claude_responses,
+        metadata=claude_metadata,
+    )
+    claude_history_entries = build_shared_claude_history_entries(
+        claude_responses,
+        now=shared_claude_now,
+    )
 
     # Get current active codex account
     current_codex_account = None
@@ -1530,7 +3555,7 @@ def main() -> int:
     usage_items: list[dict[str, Any]] = []
     cost_items: list[Any] = []
 
-    exit_codes: dict[str, Any] = {"usage": {"codex": {}, "claude": None, "gemini": None, "minimax": None}, "cost": None}
+    exit_codes: dict[str, Any] = {"usage": {"codex": {}, "claude": None, "grok": None, "antigravity": None, "minimax": None}, "cost": None}
 
     # Support multiple clawdbot state directories for minimax
     minimax_state_dirs_env = os.environ.get("CLAWDBOT_MINIMAX_STATE_DIRS", "")
@@ -1576,6 +3601,60 @@ def main() -> int:
     else:
         account_files = all_account_files
 
+    if blocked_codex_accounts:
+        filtered_account_files: list[Path] = []
+        for account_file in account_files:
+            profile = account_file.stem
+            if profile in blocked_codex_accounts:
+                errors.append(
+                    {
+                        "command": "codexbar usage --provider codex",
+                        "profile": profile,
+                        "exitCode": 0,
+                        "severity": "warning",
+                        "message": (
+                            f"Skipped blocked codex-auth profile '{profile}' from "
+                            f"{codex_switcher_state_path}. Waiting for fresh token."
+                        ),
+                    }
+                )
+                continue
+            filtered_account_files.append(account_file)
+        account_files = filtered_account_files
+
+    identity_profiles: dict[str, list[str]] = {}
+    codex_identity_fingerprint_by_profile: dict[str, str] = {}
+    codex_auth_meta_by_profile: dict[str, dict[str, Any]] = {}
+    for account_file in account_files:
+        profile = account_file.stem
+        account_payload = load_json(account_file)
+        auth_meta = codex_profile_auth_meta(account_payload, now=codex_auth_meta_generated_at)
+        if auth_meta:
+            codex_auth_meta_by_profile[profile] = auth_meta
+        identity_key = codex_profile_identity_key(account_payload)
+        if not identity_key:
+            continue
+        codex_identity_fingerprint_by_profile[profile] = short_identity_fingerprint(identity_key)
+        identity_profiles.setdefault(identity_key, []).append(profile)
+
+    for identity_key, profiles in identity_profiles.items():
+        unique_profiles = sorted(set(profiles))
+        if len(unique_profiles) < 2:
+            continue
+        errors.append(
+            {
+                "command": "codex-auth profiles",
+                "exitCode": 0,
+                "severity": "warning",
+                "profiles": unique_profiles,
+                "message": (
+                    "Multiple codex-auth profiles appear to map to the same OpenAI identity "
+                    f"(id:{short_identity_fingerprint(identity_key)}): {', '.join(unique_profiles)}. "
+                    "Re-auth one profile with the correct account to avoid duplicated dashboard usage."
+                ),
+            }
+        )
+
     if not account_files:
         errors.append(
             {
@@ -1587,7 +3666,25 @@ def main() -> int:
 
     for account_file in account_files:
         profile = account_file.stem
-        with tempfile.TemporaryDirectory(prefix="codex-home-") as tmp_home:
+        reset_credits: dict[str, Any] | None = None
+        reset_cache_entry = codex_reset_credit_cache.get(profile)
+        identity_fingerprint = codex_identity_fingerprint_by_profile.get(profile)
+        cache_matches_identity = (
+            isinstance(reset_cache_entry, dict)
+            and reset_cache_entry.get("identityFingerprint") == identity_fingerprint
+        )
+        cached_checked_at = parse_iso_datetime(reset_cache_entry.get("checkedAt")) if cache_matches_identity else None
+        cache_age_s = (
+            (datetime.now(timezone.utc) - cached_checked_at).total_seconds()
+            if cached_checked_at is not None
+            else None
+        )
+        should_refresh_reset_credits = cache_age_s is None or cache_age_s >= max(0, codex_reset_credit_interval_s)
+
+        # Codex/CodexBar may leave plugin files behind briefly in the temp HOME.
+        # We already have the command result by this point, so cleanup races
+        # should not fail the whole 5-minute stats refresh job.
+        with tempfile.TemporaryDirectory(prefix="codex-home-", ignore_cleanup_errors=True) as tmp_home:
             tmp_home_path = Path(tmp_home)
             tmp_codex_dir = tmp_home_path / ".codex"
             tmp_codex_dir.mkdir(parents=True, exist_ok=True)
@@ -1603,6 +3700,35 @@ def main() -> int:
                 timeout_s=usage_timeout_s,
                 env=env,
             )
+
+            if should_refresh_reset_credits:
+                reset_credits, reset_error = fetch_codex_reset_credits(
+                    codex_bin=codex_bin,
+                    env=env,
+                    timeout_s=codex_reset_credit_timeout_s,
+                )
+                if reset_credits is not None:
+                    codex_reset_credit_cache[profile] = {
+                        "identityFingerprint": identity_fingerprint,
+                        **reset_credits,
+                    }
+                elif reset_error:
+                    errors.append(
+                        {
+                            "command": "codex account/rateLimits/read",
+                            "profile": profile,
+                            "exitCode": 1,
+                            "severity": "warning",
+                            "message": reset_error,
+                        }
+                    )
+
+            if reset_credits is None and cache_matches_identity:
+                reset_credits = normalize_codex_reset_credits(
+                    reset_cache_entry,
+                    fetched_at=str(reset_cache_entry.get("checkedAt") or generated_at),
+                    stale=should_refresh_reset_credits,
+                )
 
         exit_codes["usage"]["codex"][profile] = res.exit_code
 
@@ -1620,7 +3746,20 @@ def main() -> int:
         for item in parsed:
             if isinstance(item, dict) and item.get("provider") != "cli":
                 item["codexAuthAccount"] = profile
+                auth_meta = codex_auth_meta_by_profile.get(profile)
+                if auth_meta:
+                    item["auth"] = dict(auth_meta)
+                if reset_credits is not None:
+                    item["rateLimitResetCredits"] = reset_credits
                 usage_items.append(item)
+
+    codex_usage_window_state = apply_codex_usage_monotonic_guard(
+        usage_items,
+        codex_usage_window_state,
+        identity_fingerprints=codex_identity_fingerprint_by_profile,
+        generated_at=generated_at,
+        errors=errors,
+    )
 
     # --- Claude usage (OAuth, configured in ~/.codexbar/config.json)
     claude_res = run_cmd(
@@ -1717,26 +3856,33 @@ def main() -> int:
         if claude_refresh_meta.get("attempted") is True:
             claude_refresh_state["lastClaudeRefreshOkAt"] = generated_at
 
-    # --- Gemini usage (API via Gemini CLI credentials)
-    gemini_res = run_cmd(
-        [codexbar_bin, "usage", "--provider", "gemini", "--source", "api", "--format", "json", "--json-only"],
-        timeout_s=usage_timeout_s,
-        env=base_env,
+    # --- Grok CLI usage (read-only billing telemetry emitted by Grok itself)
+    grok_usage, grok_exit_code = collect_grok_usage(generated_at=generated_at, base_env=base_env)
+    exit_codes["usage"]["grok"] = grok_exit_code
+    usage_items.append(grok_usage)
+
+    # --- Antigravity usage (direct API via local Antigravity CLI credentials)
+    antigravity_usage, antigravity_exit_code = collect_antigravity_usage(
+        generated_at=generated_at,
+        base_env=base_env,
+        usage_timeout_s=usage_timeout_s,
+        errors=errors,
+        max_stderr_chars=max_stderr_chars,
     )
-    exit_codes["usage"]["gemini"] = gemini_res.exit_code
-    gemini_parsed = parse_json_arrays(gemini_res.stdout, errors=errors, context="usage.gemini")
-    gemini_has_provider_error = any(isinstance(item, dict) and isinstance(item.get("error"), dict) for item in gemini_parsed)
-    if gemini_res.stderr.strip() or (gemini_res.exit_code != 0 and not gemini_has_provider_error):
-        errors.append(
-            {
-                "command": "codexbar usage --provider gemini",
-                "exitCode": gemini_res.exit_code,
-                "message": safe_tail(gemini_res.stderr, max_stderr_chars) or f"Exit {gemini_res.exit_code}",
-            }
-        )
-    for item in gemini_parsed:
-        if isinstance(item, dict) and item.get("provider") != "cli":
-            usage_items.append(item)
+    exit_codes["usage"]["antigravity"] = antigravity_exit_code
+    usage_items.append(antigravity_usage)
+
+    # --- Kimi usage (from kimi-usage.json generated by collect-kimi-usage.js)
+    kimi_usage_path = data_dir / "kimi-usage.json"
+    if kimi_usage_path.is_file():
+        try:
+            with open(kimi_usage_path, "r", encoding="utf-8") as f:
+                kimi_usage = json.load(f)
+            if isinstance(kimi_usage, dict) and kimi_usage.get("provider") == "kimi":
+                usage_items.append(kimi_usage)
+                exit_codes["usage"]["kimi"] = 0
+        except Exception:
+            pass
 
     # --- MiniMax usage from Clawdbot profiles (scan multiple directories)
     combined_clawdbot_totals = {"totalTokens": 0.0, "totalCost": 0.0, "missingCostEntries": 0.0}
@@ -1791,25 +3937,65 @@ def main() -> int:
         combined_minimax_cost += direct_minimax_usage["window"].get("totalCostUSD", 0.0)
         combined_minimax_missing += direct_minimax_usage["window"].get("missingCostEntries", 0.0)
 
-    if minimax_usage or direct_minimax_usage:
+    # --- Fetch real MiniMax API limits
+    minimax_api_limits = fetch_minimax_api_limits()
+    
+    if minimax_usage or direct_minimax_usage or minimax_api_limits:
         # Use whichever result we have as a template
         base_usage = minimax_usage or direct_minimax_usage
-        combined_percent = (combined_minimax_cost / minimax_session_budget_usd * 100.0) if minimax_session_budget_usd > 0 else 0.0
+        
+        # Get timestamps from base_usage or use current time
+        updated_at = utc_now_iso()
+        if base_usage and isinstance(base_usage.get("updatedAt"), str):
+            updated_at = base_usage["updatedAt"]
+        
+        # Use API limits if available, otherwise fall back to cost-based calculation
+        if minimax_api_limits:
+            # Format reset description
+            remaining_formatted = f"{minimax_api_limits['remaining_count']:,}"
+            total_formatted = f"{minimax_api_limits['total_count']:,}"
+            reset_in_minutes = minimax_api_limits['remains_time_seconds'] // 60
+            if reset_in_minutes < 60:
+                reset_formatted = f"{reset_in_minutes}m"
+            else:
+                reset_formatted = f"{reset_in_minutes // 60}h"
+            
+            reset_description = f"{minimax_api_limits['usage_count']:,} / {total_formatted} used · {remaining_formatted} remaining · resets in {reset_formatted}"
+            
+            primary_window = {
+                "usedPercent": minimax_api_limits["used_percent"],
+                "resetsAt": minimax_api_limits["resets_at"],
+                "resetDescription": reset_description,
+                "windowMinutes": minimax_api_limits["window_minutes"],
+                "isStatOnly": False,
+                "modelName": minimax_api_limits["model_name"],
+                "remainingCount": minimax_api_limits["remaining_count"],
+                "totalCount": minimax_api_limits["total_count"],
+                "usageCount": minimax_api_limits["usage_count"],
+            }
+            login_method = f"MiniMax API ({minimax_api_limits['model_name']})"
+            identity = {"providerID": "minimax", "loginMethod": login_method}
+        else:
+            # Fall back to cost-based percentage
+            combined_percent = (combined_minimax_cost / minimax_session_budget_usd * 100.0) if minimax_session_budget_usd > 0 else 0.0
+            primary_window = {
+                "usedPercent": combined_percent,
+                "resetsAt": base_usage.get("primary", {}).get("resetsAt") if base_usage else None,
+                "windowMinutes": minimax_session_window_minutes,
+            }
+            login_method = base_usage.get("loginMethod") if base_usage else "MiniMax"
+            identity = base_usage.get("identity") if base_usage else {"providerID": "minimax", "loginMethod": login_method}
 
         usage_items.append({
             "provider": "minimax",
             "source": "combined",
             "usage": {
-                "updatedAt": base_usage.get("updatedAt"),
-                "identity": base_usage.get("identity"),
-                "primary": {
-                    "usedPercent": combined_percent,
-                    "resetsAt": base_usage.get("primary", {}).get("resetsAt"),
-                    "windowMinutes": minimax_session_window_minutes,
-                },
+                "updatedAt": updated_at,
+                "identity": identity,
+                "loginMethod": login_method,
+                "primary": primary_window,
                 "secondary": None,
                 "tertiary": None,
-                "loginMethod": base_usage.get("loginMethod"),
                 "window": {
                     "budgetUSD": minimax_session_budget_usd,
                     "totalCostUSD": combined_minimax_cost,
@@ -1817,6 +4003,7 @@ def main() -> int:
                     "missingCostEntries": combined_minimax_missing,
                     "resetOffsetMinutes": minimax_session_reset_offset_minutes,
                 },
+                "limits": minimax_api_limits,
             },
         })
         exit_codes["usage"]["minimax"] = 0
@@ -1887,6 +4074,11 @@ def main() -> int:
     cost_items_ru = parse_json_arrays(cost_res_ru.stdout, errors=errors, context="cost.ru")
     cost_items_en = [c for c in cost_items_en if isinstance(c, dict) and c.get("provider") != "cli"]
     cost_items_ru = [c for c in cost_items_ru if isinstance(c, dict) and c.get("provider") != "cli"]
+
+    # Temporary model alias pricing: CodexBar may omit cost for gpt-5.3-codex.
+    # The expected pricing is the same as gpt-5.2.
+    apply_codex_model_alias_pricing(cost_items_en, alias_model="gpt-5.3-codex", priced_model="gpt-5.2")
+    apply_codex_model_alias_pricing(cost_items_ru, alias_model="gpt-5.3-codex", priced_model="gpt-5.2")
 
     # --- Clawdbot Claude cost (local session transcripts)
     #
@@ -2176,9 +4368,46 @@ def main() -> int:
     # Back-compat: keep the original `cost` field in EN (New York).
     cost_items = cost_items_en
 
-    # Best-effort cleanup for rare cases where CodexBar launches a Claude CLI session
-    # that detaches and keeps running.
-    run_codexbar_claude_guard()
+    claude_usage_candidate = next(
+        (item for item in usage_items if isinstance(item, dict) and item.get("provider") == "claude"),
+        {
+            "provider": "claude",
+            "status": "disabled",
+            "updatedAt": generated_at,
+        },
+    )
+    claude_usage_payload, preserved_claude_usage = select_published_claude_usage(
+        claude_usage_candidate,
+        load_json(claude_usage_path),
+        generated_at=generated_at,
+    )
+    if preserved_claude_usage:
+        for index, item in enumerate(usage_items):
+            if isinstance(item, dict) and item.get("provider") == "claude":
+                usage_items[index] = claude_usage_payload
+                break
+
+    atomic_write_json(claude_stats_path, claude_stats_payload)
+    atomic_write_json(claude_usage_path, claude_usage_payload)
+
+    unpublished_providers = {"minimax"}
+
+    def is_unpublished_provider_entry(entry: Any) -> bool:
+        if isinstance(entry, dict):
+            return str(entry.get("provider", "")).strip().lower() in unpublished_providers
+        return False
+
+    def entry_mentions_unpublished_provider(entry: Any) -> bool:
+        if is_unpublished_provider_entry(entry):
+            return True
+        text = entry if isinstance(entry, str) else json.dumps(entry, ensure_ascii=False)
+        lower = str(text).lower()
+        return any(provider in lower for provider in unpublished_providers)
+
+    published_usage_items = [item for item in usage_items if not is_unpublished_provider_entry(item)]
+    published_cost_items_en = [item for item in cost_items_en if not is_unpublished_provider_entry(item)]
+    published_cost_items_ru = [item for item in cost_items_ru if not is_unpublished_provider_entry(item)]
+    published_errors = [item for item in errors if not entry_mentions_unpublished_provider(item)]
 
     latest = {
         "generatedAt": generated_at,
@@ -2186,13 +4415,13 @@ def main() -> int:
         "currentCodexAccount": current_codex_account,
         "claudeActivity": claude_activity,
         "claudeRefresh": claude_refresh_meta,
-        "usage": usage_items,
-        "cost": cost_items,
+        "usage": published_usage_items,
+        "cost": published_cost_items_en,
         "costByLang": {
-            "en": cost_items_en,
-            "ru": cost_items_ru,
+            "en": published_cost_items_en,
+            "ru": published_cost_items_ru,
         },
-        "errors": errors,
+        "errors": published_errors,
     }
 
     last_run = {
@@ -2202,12 +4431,49 @@ def main() -> int:
         "errors": errors,
     }
 
-    atomic_write_json(data_dir / "latest.json", latest)
+    def write_latest_with_switcher_lock() -> None:
+        # Coordinate with codex-auth-switcher.py, which patches
+        # currentCodexAccount into this file between polls (same lock path there).
+        _web_lock = None
+        try:
+            _web_lock = open("/run/lock/codex-latest-json.lock", "w", encoding="utf-8")
+            fcntl.flock(_web_lock.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            _web_lock = None
+        try:
+            atomic_write_json(data_dir / "latest.json", latest)
+        finally:
+            if _web_lock is not None:
+                try:
+                    fcntl.flock(_web_lock.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                _web_lock.close()
+
+    write_latest_with_switcher_lock()
     atomic_write_json(data_dir / "last-run.json", last_run)
     atomic_write_json(claude_refresh_state_path, claude_refresh_state)
+    atomic_write_json(codex_reset_credit_cache_path, codex_reset_credit_cache)
+    atomic_write_json(codex_usage_window_state_path, codex_usage_window_state)
 
-    # Update hourly history for heatmap (only current codex account)
-    update_hourly_history(data_dir, usage_items, generated_at, current_codex_account)
+    # Update hourly history for heatmap for all providers/accounts.
+    update_hourly_history(
+        data_dir,
+        published_usage_items,
+        generated_at,
+        current_codex_account,
+        provider_history_entries=claude_history_entries,
+        excluded_providers=unpublished_providers,
+    )
+    error_count_before_publish = len(errors)
+    publish_shared_claude_webhost_files(errors=errors, max_stderr_chars=max_stderr_chars)
+    if len(errors) != error_count_before_publish:
+        published_errors = [item for item in errors if not entry_mentions_unpublished_provider(item)]
+        latest["errors"] = published_errors
+        last_run["ok"] = len(errors) == 0
+        last_run["errors"] = errors
+        write_latest_with_switcher_lock()
+        atomic_write_json(data_dir / "last-run.json", last_run)
 
     return 0 if last_run["ok"] else 0
 

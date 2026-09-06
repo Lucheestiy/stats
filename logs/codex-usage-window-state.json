@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "updatedAt": "2026-09-06T02:55:51Z",
+  "accounts": {
+    "tmr": {
+      "identityFingerprint": "cddcc35408",
+      "resetsAt": "2026-09-07T02:26:50Z",
+      "windowMinutes": 10080,
+      "usedPercent": 100,
+      "lastSampledUsedPercent": 100,
+      "observedAt": "2026-09-06T02:55:51Z",
+      "lastRegressionAt": "2026-08-08T14:51:39Z"
+    },
+    "pr": {
+      "identityFingerprint": "f8ab914d90",
+      "resetsAt": "2026-09-08T01:21:25Z",
+      "windowMinutes": 10080,
+      "usedPercent": 100,
+      "lastSampledUsedPercent": 100,
+      "observedAt": "2026-09-06T02:55:51Z",
+      "lastRegressionAt": "2026-08-08T06:09:45Z"
+    },
+    "rl": {
+      "identityFingerprint": "e2581a8bcd",
+      "resetsAt": "2026-09-07T07:05:38Z",
+      "windowMinutes": 10080,
+      "usedPercent": 100,
+      "lastSampledUsedPercent": 100,
+      "observedAt": "2026-09-06T02:55:51Z",
+      "lastRegressionAt": "2026-08-08T05:17:30Z"
+    },
+    "kr": {
+      "identityFingerprint": "84aa3a56a4",
+      "resetsAt": "2026-09-07T11:46:39Z",
+      "windowMinutes": 10080,
+      "usedPercent": 91,
+      "lastSampledUsedPercent": 91,
+      "observedAt": "2026-09-06T02:55:51Z"
+    },
+    "sn": {
+      "identityFingerprint": "65b863cd86",
+      "resetsAt": "2026-09-07T07:40:21Z",
+      "windowMinutes": 10080,
+      "usedPercent": 100,
+      "lastSampledUsedPercent": 100,
+      "observedAt": "2026-09-06T02:55:51Z",
+      "lastRegressionAt": "2026-08-08T20:31:00Z"
+    },
+    "vl": {
+      "identityFingerprint": "af0979088c",
+      "resetsAt": "2026-08-22T17:50:16Z",
+      "windowMinutes": 10080,
+      "usedPercent": 0,
+      "lastSampledUsedPercent": 0,
+      "observedAt": "2026-08-15T17:50:11Z"
+    },
+    "me": {
+      "identityFingerprint": "8bcd4e54e7",
+      "resetsAt": "2026-09-07T07:44:47Z",
+      "windowMinutes": 10080,
+      "usedPercent": 100,
+      "lastSampledUsedPercent": 100,
+      "observedAt": "2026-09-06T02:55:51Z"
+    },
+    "cm": {
+      "identityFingerprint": "e6dfdeecad",
+      "resetsAt": "2026-09-07T07:55:08Z",
+      "windowMinutes": 10080,
+      "usedPercent": 78,
+      "lastSampledUsedPercent": 78,
+      "observedAt": "2026-09-06T02:55:51Z"
+    }
+  }
+}

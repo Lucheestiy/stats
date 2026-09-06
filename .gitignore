@@ -6,4 +6,5 @@ public/data/.*
 # Local/editor noise
 .DS_Store
 *.log
+logs/codex-reset-credits-cache.json
 __pycache__/

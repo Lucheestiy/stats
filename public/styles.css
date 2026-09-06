@@ -35,6 +35,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
@@ -221,7 +225,7 @@ body {
 
 .providerIcon.codex { background: linear-gradient(135deg, #38d996, #2ecc71); }
 .providerIcon.claude { background: linear-gradient(135deg, #cc785c, #d4a574); }
-.providerIcon.gemini { background: linear-gradient(135deg, #4285f4, #34a853); }
+.providerIcon.antigravity { background: linear-gradient(135deg, #ea4335, #4285f4 52%, #34a853); }
 
 .pill {
   display: inline-flex;

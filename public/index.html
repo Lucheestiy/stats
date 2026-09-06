@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CodexBar Dashboard</title>
     <meta name="description" content="CodexBar stats dashboard - AI usage and cost monitoring" />
-    <link rel="stylesheet" href="/styles.css?v=22" />
+    <link rel="stylesheet" href="/styles.css?v=25" />
           <!-- Favicons -->
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=2">
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png?v=2">
@@ -68,8 +68,8 @@
       <section id="providers" class="grid" aria-live="polite"></section>
 
       <!-- Cost Chart Section -->
-      <div class="sectionTitle" data-i18n="costTrend">Cost Trend (30 Days)</div>
-      <section id="chartSection" class="grid chartSection">
+      <div class="sectionTitle" data-i18n="costTrend" hidden>Cost Trend (30 Days)</div>
+      <section id="chartSection" class="grid chartSection" hidden>
         <div class="card chartCard">
           <div class="chartContainer">
             <canvas id="costChart" class="chartCanvas"></canvas>
@@ -82,8 +82,8 @@
       </section>
 
       <!-- Cost Cards Section -->
-      <div class="sectionTitle" data-i18n="costLocal">Cost (Local Logs)</div>
-      <section id="cost" class="grid" aria-live="polite"></section>
+      <div class="sectionTitle" data-i18n="costLocal" hidden>Cost (Local Logs)</div>
+      <section id="cost" class="grid" aria-live="polite" hidden></section>
 
       <!-- Heatmap Section -->
       <div class="sectionTitle" data-i18n="usageByHour">Usage by Hour</div>
@@ -116,6 +116,6 @@ fetch('https://stats.lucheestiy.com/data/latest.json')
       <span data-i18n="footer">Updated every ~5 minutes (systemd timer). Cost is aggregated per provider on this machine.</span>
     </footer>
 
-    <script src="/app.js?v=22"></script>
+    <script src="/app.js?v=25"></script>
   </body>
 </html>
